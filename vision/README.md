@@ -1,6 +1,6 @@
-# Robot vision
+# Vsion Prototype
 
-Offline video replay with OpenCV or pretrained SegFormer B0/B2, optional Depth Anything, and mock navigation decisions. No motor commands.
+This is a vision prototype I'm playing around with for path estimation and object detection. 99% vibecoded
 
 ## Setup
 
