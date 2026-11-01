@@ -1,0 +1,5 @@
+numpy>=2.0,<3
+opencv-python>=4.10,<6
+torch>=2.6,<3
+transformers>=4.45,<5
+Pillow>=10,<13
