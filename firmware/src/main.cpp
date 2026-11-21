@@ -3,7 +3,8 @@
 
 void setup() {
   // put your setup code here, to run once:
-  Serial.printf("PSRAM: %d bytes\n", ESP.getPsramSize());
+  Serial0.begin(115200);
+  Serial0.printf("PSRAM: %d bytes\n", ESP.getPsramSize());
 }
 
 void loop() {
