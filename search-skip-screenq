@@ -1,0 +1,19 @@
+[33mcommit e7012d1a99ab187fd1d61685312d6c1585660795[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mevanfosta[m[33m, [m[1;31morigin/evanfosta[m[33m)[m
+Author: Evan Foster <evanfoster2007@gmail.com>
+Date:   Sun Nov 1 18:19:59 2026 -0500
+
+    update README.md for vision prototype
+
+[1mdiff --git a/vision/README.md b/vision/README.md[m
+[1mindex d9c0e75..5af2758 100644[m
+[1m--- a/vision/README.md[m
+[1m+++ b/vision/README.md[m
+[36m@@ -1,6 +1,6 @@[m
+[31m-# Robot vision[m
+[32m+[m[32m# Vsion Prototype[m
+ [m
+[31m-Offline video replay with OpenCV or pretrained SegFormer B0/B2, optional Depth Anything, and mock navigation decisions. No motor commands.[m
+[32m+[m[32mThis is a vision prototype I'm playing around with for path estimation and object detection. 99% vibecoded[m
+ [m
+ ## Setup[m
+ [m
