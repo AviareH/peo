@@ -8,9 +8,10 @@ const char* wifiName = "PEO-Camera";
 const char* wifiPassword = "peocamera123";
 
 bool initializeCamera() {
+  // Zero-initialize optional driver fields, then apply this board's pin map.
   camera_config_t config = {};
 
-  // Camera connections for the ESP32
+  // Camera data and sync pins connect directly to the ESP32-S3.
   config.pin_pwdn = -1;
   config.pin_reset = -1;
   config.pin_xclk = 15;
@@ -30,12 +31,12 @@ bool initializeCamera() {
   config.pin_href = 7;
   config.pin_pclk = 13;
 
-  // Generate the camera clock
+  // Configure the camera XCLK using LEDC channel 0.
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
   config.xclk_freq_hz = 20000000;
 
-  // 640 x 480 with JPEG compression
+  // JPEG/VGA keeps frames compact enough for streaming over the access point.
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size = FRAMESIZE_VGA;
   config.jpeg_quality = 12;
@@ -70,6 +71,7 @@ esp_err_t streamHandler(httpd_req_t* request) {
 
   httpd_resp_set_hdr(request, "Cache-Control", "no-store");
 
+  // Keep the HTTP response open and stream each captured JPEG as a frame.
   while (true) {
     // Borrow a captured image from the camera driver
     camera_fb_t* frame = esp_camera_fb_get();
@@ -118,6 +120,7 @@ esp_err_t streamHandler(httpd_req_t* request) {
 
 
 bool startStreamingServer() {
+  // Pin the HTTP server to core 0, separate from motor control on core 1.
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.core_id = 0;
@@ -132,6 +135,7 @@ bool startStreamingServer() {
   }
 
   httpd_uri_t streamRoute = {};
+  // Expose the multipart JPEG handler at /stream.
   streamRoute.uri = "/stream";
   streamRoute.method = HTTP_GET;
   streamRoute.handler = streamHandler;
@@ -140,6 +144,7 @@ bool startStreamingServer() {
 
   if (result != ESP_OK) {
     Serial0.printf("Stream route registration failed: 0x%x\n", result);
+    // Do not leave a server running without its stream endpoint.
     httpd_stop(server);
     return false;
   }
@@ -149,11 +154,13 @@ bool startStreamingServer() {
 
 
 bool startCameraStreaming() {
+  // Camera frame buffers are allocated in PSRAM, so fail before Wi-Fi startup.
   if (!psramFound() || !initializeCamera()) {
     Serial0.println("Camera or PSRAM initialization failed");
     return false;
   }
 
+  // The computer joins this access point for both video and motor commands.
   WiFi.mode(WIFI_AP);
 
   if (!WiFi.softAP("PEO-Camera", "peocamera123")) {
