@@ -14,11 +14,13 @@ computer or Wi-Fi link stops sending commands.
 
 ## Setup
 
-1. Connect the two left motors to one DRV8833 output channel and the two right
-   motors to its other channel. The motors on each side run together.
-2. Check that each motor pair's stall current is within the DRV8833 board's
-   current rating. Power the motors from a suitable motor supply, not the ESP32
-   board, and connect the motor-supply ground to ESP32 ground.
+1. Connect the left motors to one DRV8871 and the right motors to the other.
+   Each side's motors connect across that driver's `OUT1` and `OUT2`.
+2. Check each motor pair's combined stall current against its breakout's
+   current and thermal limits. Connect both drivers' `VM` pins to the motor
+   supply and tie both driver grounds, the supply ground and the ESP32 ground
+   together. Use a supply within the motors' and breakouts' ratings. The
+   DRV8871 chip's recommended `VM` range is 6.5–45 V. [DRV8871 datasheet](https://www.ti.com/lit/ds/symlink/drv8871.pdf)
 3. Flash the firmware and connect the computer to the ESP32's `PEO-Camera`
    Wi-Fi access point. The camera stream is available at
    `http://192.168.4.1/stream`.
@@ -32,10 +34,117 @@ numbers, pass `--left-axis` and `--right-axis` accordingly. The sender sends
 zero motor requests when stopped with Ctrl+C; the ESP32 timeout also stops
 motors if commands cease.
 
+## Mode selection and live display
+
+The board boots in **MANUAL**. Centre both sticks to connect. Press
+**Share** (Select/Back) to switch to **AUTONOMOUS**. Press it again to return
+to manual. The sender uses SDL's mapped Back button. For a controller with
+a different mapping, pass `--mode-button N` with its raw pygame button index.
+Holding the button makes one change. On return to manual with a displaced
+stick, centre both sticks before driving.
+
+The controller sender publishes `PAD,sequence,M,left,right` or
+`PAD,sequence,A,0,0` every 20 ms. The sequence is a laptop monotonic
+microsecond counter. Retries carry the desired mode. The ESP32 ignores old
+sequence numbers and other senders while the pad session is active. Legacy
+`left,right` PWM works in manual outside a pad session. A mode change clears
+pending drive and zeros PWM at the next motor tick. Autonomous mode currently
+waits at zero PWM for a live CV command. Release Share before pressing it again.
+
+After 150 ms without accepted input, the board clears drive and returns to
+manual. Reconnect in manual with both sticks centred. If the sender still
+requests autonomous after a link loss, press Share to request manual first.
+
+Open `http://192.168.4.1:81/` for the labelled browser stream. Navigating
+to `/stream` in a browser also opens this viewer. The viewer and laptop CV
+previews read the board's current mode from `http://192.168.4.1:81/mode`
+on a separate HTTP worker. A status failure displays **UNKNOWN**. The raw
+MJPEG endpoint on port 80 includes an `X-Drive-Mode` part header with each
+JPEG. The overlay is drawn by the viewer, keeping camera input clean for CV.
+Use one video consumer at a time.
+
+## AS5600 wheel encoders
+
+Set the four GPIOs in [`include/encoder_config.h`](include/encoder_config.h).
+Use one SDA/SCL pair per AS5600 because both respond to `0x36`. The left
+encoder uses hardware I²C0 and the right encoder uses software I²C. This
+firmware build uses hardware I²C1 for the camera. Keep the two encoder buses
+separate, share ground, and use 3.3 V I²C levels and pull-ups on each pair.
+Leaving all four GPIOs at `-1` disables sampling. [AS5600 datasheet](https://www.flywing-tech.com/blog/wp-content/uploads/2026/03/AS5600_DS000365_5-00.pdf)
+
+The configuration uses the following pins from the supplied ESP32-S3 camera
+board pinout. It assumes the board's SD and external JTAG connections are
+unused. [ESP32-S3 GPIO reference](https://docs.espressif.com/projects/esp-idf/en/v4.4.8/esp32s3/api-reference/peripherals/gpio.html)
+
+| AS5600 connection | Left encoder | Right encoder |
+| --- | --- | --- |
+| SDA | GPIO1 | GPIO38 |
+| SCL | GPIO14 | GPIO39 |
+| Power for a 3.3 V-compatible breakout | 3V3 | 3V3 |
+| Ground | GND | GND |
+
+If a breakout lacks I²C pull-ups, add a pull-up to 3V3 on each of its SDA and
+SCL lines. Tie any exposed, unstrapped DIR pin to GND.
+
+1. `printCounts` is enabled for setup. Flash and open the serial monitor at 115200 baud.
+   Rotate each wheel forward by hand. Its count should increase. Flip its
+   `leftDirection` or `rightDirection` sign if it decreases.
+2. Roll straight over a measured distance. Divide each side's change in counts
+   by the distance in metres and enter `leftCountsPerMetre` and `rightCountsPerMetre`.
+3. Turn in place by a measured angle. Convert both count changes to metres.
+   Divide the sum of their magnitudes by the absolute turn angle in radians,
+   then multiply by 1000 for `trackWidthMm`. Use the intended floor for the
+   measured turn. Set `printCounts = false` and flash the calibration.
+
+The reader checks magnet status and tracks angle across the 4095-to-0 wrap.
+Mount one encoder per drive side and keep shaft travel below half a revolution
+between samples. Sampling is nominally every 10 ms. Encoder-controlled motion
+requires both samples and the three calibration values. The ESP32 stops each
+side when it reaches its count target, turns before driving, and reports
+`DONE` after both sides finish. Sensor loss, missing calibration, insufficient
+wheel progress, or a phase over three seconds causes `FAULT`. Switch back to
+manual before rearming after a fault.
+
+## CV movement protocol
+
+Run the PS4 sender and the [live tape runner](../vision/README.md#drive-from-live-tape)
+on the same laptop. The runner uses the camera host and UDP port 4210. It
+uses `--actuate-encoders` to send the turn in milliradians and forward distance
+in millimetres. For timed trials, `--actuate` converts both values to milliseconds
+using the supplied scales.
+
+A positive turn runs the left motors in reverse and the right motors forward.
+A negative turn swaps those directions. A turn with zero forward distance
+finishes at the end of the turn. When a forward drive follows, the board zeros
+PWM for 60 ms between phases. Each phase uses the existing motor ramp toward a target
+of 80 out of 255 PWM. Encoder steps are limited to 700 milliradians and 300 mm.
+Timed phases are limited to 1500 ms each. In timed mode, `DONE` confirms the
+scheduled output ended. Actual movement depends on the floor, battery and load.
+
+The board accepts one move at a time in the current autonomous session. Fresh
+frames renew the move under the same ID. After `DONE`, the laptop waits for a
+frame received after that reply before planning again. The board zeros PWM on
+Share back to manual, a CV stop, 150 ms without PS4 input, or 250 ms without a
+renewal of the active move. The two timeouts are independent.
+
+Timed moves use `CV,sequence,session,move,turn_ms,drive_ms`. Encoder moves use
+`ENC,sequence,session,move,turn_mrad,drive_mm`. A `CV` status poll sends zero for
+the last four fields. With a valid session and new move ID, setting both motion
+fields to zero cancels motion. The response is `CV,sequence,session,move,state`. It echoes the
+request sequence and reports the current move ID and `MANUAL`, `IDLE`,
+`RUNNING`, `DONE`, `STOPPED`, or `FAULT`. A mode change or controller timeout
+invalidates the session. Commands must come from the active PS4 sender's IP.
+
 ## Motor driver
 
-The default DRV8833 GPIO assignments are defined in `src/motors.cpp`. Confirm
-that these pins match your ESP32-S3 board and wiring before powering the
-motors. Test with the wheels raised and an accessible power cutoff: the
-controller commands powered motion, and the ramp does not replace a physical
-emergency stop.
+The two DRV8871s use 3.3 V logic from the ESP32 and 20 kHz PWM. Either input
+going high wakes the driver. The assignments are defined in `src/motors.cpp`.
+[DRV8871 datasheet](https://www.ti.com/lit/ds/symlink/drv8871.pdf)
+
+| Driver | IN1 | IN2 |
+| --- | --- | --- |
+| Left DRV8871 | GPIO21 | GPIO47 |
+| Right DRV8871 | GPIO41 | GPIO42 |
+
+Confirm the wiring against your breakout labels before powering the motors.
+Test with the wheels raised and the propulsion power cutoff within reach.

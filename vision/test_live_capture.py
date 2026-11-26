@@ -14,7 +14,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from live_capture import LiveCapture
+from live_capture import LiveCapture, ModeMonitor
 
 
 class FakeDecoder:
@@ -35,7 +35,8 @@ class FakeDecoder:
 class LiveCaptureTests(unittest.TestCase):
     def setUp(self):
         self.decoder = FakeDecoder()
-        with patch("live_capture.cv2.VideoCapture", return_value=self.decoder):
+        with (patch("live_capture.cv2.VideoCapture", return_value=self.decoder),
+              patch("live_capture.ModeMonitor")):
             self.capture = LiveCapture("http://camera/stream", 50, 1000)
 
     def tearDown(self):
@@ -81,9 +82,50 @@ class LiveCaptureTests(unittest.TestCase):
 
 
 class StreamPipelineTests(unittest.TestCase):
+    def test_board_mode_changes_and_missing_status(self):
+        class Status(BaseHTTPRequestHandler):
+            value = b"MANUAL"
+
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                self.send_response(200 if self.path == "/mode" else 404)
+                self.end_headers()
+                self.wfile.write(self.value)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Status)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        monitor = ModeMonitor(f"http://127.0.0.1:{server.server_port-1}/stream")
+        try:
+            import time
+            for value, expected in [(b"MANUAL", "MANUAL"), (b"AUTONOMOUS", "AUTONOMOUS"),
+                                    (b"unavailable", "UNKNOWN")]:
+                Status.value = value
+                deadline = time.monotonic() + 2
+                while monitor.mode != expected and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertEqual(monitor.mode, expected)
+        finally:
+            monitor.close()
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_http_mjpeg_reaches_existing_pipeline_and_recording(self):
+        self.exercise_http_pipeline("classical")
+
+    def test_http_mjpeg_reaches_tape_detector_and_mock_sink(self):
+        self.exercise_http_pipeline("tape")
+
+    def exercise_http_pipeline(self, method):
         stopped = threading.Event()
-        ok, jpeg = cv2.imencode(".jpg", np.full((120, 160, 3), 150, np.uint8))
+        frame = np.full((120, 160, 3), 150, np.uint8)
+        if method == "tape":
+            for x in (50, 110):
+                cv2.line(frame, (x, 119), (x-10, 44), (255, 0, 0), 6)
+        ok, jpeg = cv2.imencode(".jpg", frame)
         self.assertTrue(ok)
         payload = jpeg.tobytes()
 
@@ -112,7 +154,7 @@ class StreamPipelineTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 command = [sys.executable, str(Path(__file__).with_name("run.py")),
                            "--stream", f"http://127.0.0.1:{server.server_port}/stream",
-                           "--max-frames", "3", "--output-dir", directory]
+                           "--method", method, "--max-frames", "3", "--output-dir", directory]
                 result = subprocess.run(command, capture_output=True, text=True, timeout=20)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 log = next(Path(directory).glob("*_detections.jsonl"))
@@ -120,10 +162,17 @@ class StreamPipelineTests(unittest.TestCase):
                 self.assertEqual(records[0]["input_mode"], "live")
                 frames = [record for record in records if record["type"] == "frame"]
                 self.assertEqual(len(frames), 3)
+                self.assertTrue(all(frame["drive_mode"] == "UNKNOWN" for frame in frames))
                 self.assertTrue(all(0 <= frame["frame_age_ms"] < 2000 for frame in frames))
-                self.assertTrue(all(not frame["navigation"]["decision"]["motion_authorized"]
-                                    for frame in frames))
-                self.assertTrue(records[-1]["frame_limit_reached"])
+                if method == "tape":
+                    self.assertTrue(all(frame["proposal"]["reason"] == "calibration_required"
+                                        and frame["centreline_px"] for frame in frames))
+                    self.assertEqual(records[-1]["proposal"]["reason"], "frame_limit")
+                    self.assertFalse(records[-1]["proposal"]["actions"])
+                else:
+                    self.assertTrue(all(not frame["navigation"]["decision"]["motion_authorized"]
+                                        for frame in frames))
+                    self.assertTrue(records[-1]["frame_limit_reached"])
                 recording = cv2.VideoCapture(str(next(Path(directory).glob("*.mp4"))))
                 try:
                     self.assertTrue(recording.read()[0])

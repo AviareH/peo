@@ -10,6 +10,7 @@ import cv2
 
 from detector import ObstacleDetector, Settings
 from cli import parse_args
+from drawing import draw_drive_mode
 from reporting import run_record, frame_record
 from video_io import (pick_video, prepare, start_capture, output_paths,
                       open_preview, preview_stopped)
@@ -20,6 +21,10 @@ from playback import four_panel, render_segmentation, render_single
 
 def run(args) -> None:
     source = args.stream or (args.video or pick_video()).expanduser().resolve()
+    if args.method == "tape":
+        from tape_run import run_tape
+        run_tape(args, source)
+        return
     if not args.stream and not source.is_file():
         raise ValueError(f"Video does not exist: {source}")
     settings = Settings(**{key: getattr(args, key) for key in Settings.__dataclass_fields__})
@@ -91,6 +96,8 @@ def run(args) -> None:
                     overlay = render_single(segmentation, plan, debug_panels, args.debug)
                 frame_age_ms = None
                 if args.stream:
+                    drive_mode = capture.drive_mode
+                    draw_drive_mode(overlay, drive_mode)
                     frame_age_ms = (time.monotonic() - capture.received_at) * 1000
                     if frame_age_ms > args.max_frame_age_ms:
                         raise ValueError("Live frame became stale during processing; stopping vision.")
@@ -100,6 +107,7 @@ def run(args) -> None:
                 record = frame_record(count, position_ms, result, plan, args.method,
                                       depth_result, depth_view.limits if depth_result is not None else None)
                 if args.stream:
+                    record["drive_mode"] = drive_mode
                     record["frame_age_ms"] = round(frame_age_ms, 3)
                 if depth_result is not None:
                     depth_elapsed_ms += depth_result["processing_ms"]

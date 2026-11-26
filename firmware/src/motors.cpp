@@ -8,8 +8,9 @@
 // used to access the motor command queue
 // nullptr until the queue is created and static keeps variable local to motors.cpp
 static QueueHandle_t commandQueue = nullptr;
+static TaskHandle_t motorTask = nullptr;
 
-// Each motor side uses one DRV8833 channel; the paired motors run together.
+// Each motor side uses one DRV8871; the paired motors run together.
 const int MOTOR_A_IN1 = 21;
 const int MOTOR_A_IN2 = 47;
 const int MOTOR_B_IN1 = 41;
@@ -103,7 +104,7 @@ bool initializeMotors() {
       !configureMotorPwm(MOTOR_A_IN2, MOTOR_A_IN2_CHANNEL) ||
       !configureMotorPwm(MOTOR_B_IN1, MOTOR_B_IN1_CHANNEL) ||
       !configureMotorPwm(MOTOR_B_IN2, MOTOR_B_IN2_CHANNEL)) {
-    Serial0.println("Motor PWM setup failed");
+    Serial.println("Motor PWM setup failed");
     return false;
   }
 
@@ -128,6 +129,12 @@ void sendMotorCommand(MotorCommand command) {
 }
 
 
+void stopMotorControl() {
+  sendMotorCommand({0, 0});
+  // Latch the stop even if another UDP packet overwrites the one-item queue.
+  if (motorTask != nullptr) xTaskNotifyGive(motorTask);
+}
+
 void updateMotors(void* parameters) {
   (void)parameters;
   TickType_t lastWakeTime = xTaskGetTickCount();
@@ -150,8 +157,12 @@ void updateMotors(void* parameters) {
       );
     }
 
-    leftSpeed = rampMotorSpeed(leftSpeed, target.leftSpeed);
-    rightSpeed = rampMotorSpeed(rightSpeed, target.rightSpeed);
+    if (ulTaskNotifyTake(pdTRUE, 0)) {
+      target = {};
+      leftSpeed = rightSpeed = 0;
+    }
+    leftSpeed = target.cutZero && !target.leftSpeed ? 0 : rampMotorSpeed(leftSpeed, target.leftSpeed);
+    rightSpeed = target.cutZero && !target.rightSpeed ? 0 : rampMotorSpeed(rightSpeed, target.rightSpeed);
 
     setMotorSpeed(
         leftSpeed,
@@ -188,7 +199,7 @@ bool startMotorControl() {
       4096,
       nullptr,
       6,
-      nullptr,
+      &motorTask,
       1
   );
 

@@ -15,6 +15,7 @@ def pick_video() -> Path:
         root.withdraw()
         try:
             name = filedialog.askopenfilename(title="Select robot test footage",
+                                              initialdir=str(Path(__file__).resolve().parent / "footage"),
                                               filetypes=[("Video", "*.mov *.MOV *.mp4 *.MP4 *.avi"),
                                                          ("All files", "*")])
         finally:
@@ -41,11 +42,13 @@ def prepare(frame: np.ndarray, args) -> np.ndarray:
 
 
 def start_capture(capture: cv2.VideoCapture, start_seconds: float,
-                  live: bool = False) -> tuple[float, np.ndarray]:
+                  live: bool = False, auto_orientation: bool = True) -> tuple[float, np.ndarray]:
     """Validate the decoder and read the first frame before loading models."""
     if not capture.isOpened():
         raise ValueError("Cannot open video. Try exporting an H.264 MP4 copy.")
-    capture.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1)
+    capture.set(cv2.CAP_PROP_ORIENTATION_AUTO, int(auto_orientation))
+    if not auto_orientation and capture.get(cv2.CAP_PROP_ORIENTATION_AUTO) > 0:
+        raise ValueError("Cannot disable decoder auto-rotation for tape image coordinates.")
     fps = capture.get(cv2.CAP_PROP_FPS)
     if not math.isfinite(fps) or fps <= 0:
         fps = 30.0
@@ -83,10 +86,10 @@ def open_preview(width: int, height: int) -> None:
     cv2.resizeWindow(PREVIEW_TITLE, round(width * scale), round(height * scale))
 
 
-def preview_stopped(overlay: np.ndarray, fps: float, live: bool = False) -> bool:
+def preview_stopped(overlay: np.ndarray, fps: float, live: bool = False, allow_pause: bool = True) -> bool:
     """Show a frame; space waits for another key, Q/Esc exits replay."""
     cv2.imshow(PREVIEW_TITLE, overlay)
     key = cv2.waitKey(1 if live else max(1, round(1000 / fps))) & 0xFF
-    if key == ord(" "):
+    if allow_pause and key == ord(" "):
         key = cv2.waitKey(0) & 0xFF
     return key in (ord("q"), 27)

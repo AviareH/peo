@@ -2,3 +2,4 @@
 
 // Start the core-1 UDP listener for joystick commands sent by the host computer.
 bool startPS4Controller();
+const char* driveModeName();

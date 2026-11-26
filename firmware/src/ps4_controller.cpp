@@ -1,52 +1,90 @@
 #include <Arduino.h>
-#include <cstdio>
+#include <atomic>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "motors.h"
 #include "ps4_controller.h"
+#include "drive_input.h"
+#include "encoder_config.h"
+#include "vision_drive.h"
 
 static constexpr uint16_t MOTOR_COMMAND_PORT = 4210;
 static constexpr uint32_t COMMAND_TIMEOUT_MS = 150;
-static constexpr size_t COMMAND_BUFFER_SIZE = 32;
+static constexpr size_t COMMAND_BUFFER_SIZE = 64;
 
 // Shared by the receiver task after the listener is started.
 static WiFiUDP commandSocket;
 
-static bool parseMotorCommand(const char* packet, int* left, int* right) {
-  // The host sends signed PWM values as "left,right"; reject extra data and
-  // constrain both sides to the motor driver's 8-bit duty range.
-  char trailing = '\0';
-  if (std::sscanf(packet, "%d,%d%c", left, right, &trailing) != 2) {
-    return false;
-  }
-  *left = constrain(*left, -255, 255);
-  *right = constrain(*right, -255, 255);
-  return true;
+static std::atomic<bool> autonomous{false};
+
+const char* driveModeName() {
+  return autonomous.load() ? "AUTONOMOUS" : "MANUAL";
+}
+
+static void applyMotorAction(InputAction action, MotorCommand pwm) {
+  if (action == InputAction::Stop) stopMotorControl();
+  if (action == InputAction::Drive) sendMotorCommand(pwm);
 }
 
 static void motorCommandReceiverTask(void* parameters) {
   (void)parameters;
   char packet[COMMAND_BUFFER_SIZE];
+  DriveInput input;
+  VisionDrive vision({encoderConfig::leftCountsPerMetre, encoderConfig::rightCountsPerMetre,
+                     encoderConfig::trackWidthMm});
   // Start the failsafe timer immediately so motors stop if no host connects.
   uint32_t lastCommandTime = millis();
-  bool stoppedForTimeout = false;
+  bool stoppedForTimeout = true;
 
   while (true) {
+    const EncoderSample encoders = readWheelEncoders();
+    const uint32_t now = millis();
+    if (!stoppedForTimeout && now - lastCommandTime > COMMAND_TIMEOUT_MS) {
+      stopMotorControl();
+      input.disconnect();
+      vision.setSession(0);
+      autonomous.store(false);
+      stoppedForTimeout = true;
+    }
+    MotorCommand pwm{};
+    const auto tick = vision.update(now, pwm, encoders);
+    applyMotorAction(tick, pwm);
+
     const int packetLength = commandSocket.parsePacket();
     if (packetLength > 0) {
       if (packetLength < static_cast<int>(sizeof(packet))) {
         const int bytesRead = commandSocket.read(packet, sizeof(packet) - 1);
-        if (bytesRead > 0) {
+        if (bytesRead == packetLength && !std::memchr(packet, 0, bytesRead)) {
           packet[bytesRead] = '\0';
-          int left = 0;
-          int right = 0;
-          if (parseMotorCommand(packet, &left, &right)) {
-            // The motor task consumes the newest target and ramps toward it.
-            sendMotorCommand({left, right});
-            lastCommandTime = millis();
-            stoppedForTimeout = false;
+          const uint64_t peer = (uint64_t(uint32_t(commandSocket.remoteIP())) << 16) |
+                                commandSocket.remotePort();
+          if (std::strncmp(packet, "CV,", 3) == 0 || std::strncmp(packet, "ENC,", 4) == 0) {
+            VisionRequest request{};
+            if (input.isPadHost(peer) && VisionRequest::parse(packet, request)) {
+              const IPAddress remote = commandSocket.remoteIP();
+              const uint16_t port = commandSocket.remotePort();
+              const auto action = vision.receive(request, now, pwm, encoders);
+              applyMotorAction(action, pwm);
+              char reply[COMMAND_BUFFER_SIZE];
+              const int size = std::snprintf(reply, sizeof(reply), "CV,%llu,%llu,%llu,%s",
+                                             request.sequence, (unsigned long long)vision.session(),
+                                             (unsigned long long)vision.move(), vision.state());
+              if (size > 0 && size < int(sizeof(reply)) && commandSocket.beginPacket(remote, port)) {
+                commandSocket.write(reinterpret_cast<const uint8_t*>(reply), size);
+                commandSocket.endPacket();
+              }
+            }
+          } else {
+            const auto action = input.receive(packet, peer, pwm);
+            if (action != InputAction::Ignore) {
+              if (action == InputAction::Stop) vision.setSession(input.autonomous ? input.padSequence() : 0);
+              applyMotorAction(action, pwm);
+              autonomous.store(input.autonomous);
+              lastCommandTime = now;
+              stoppedForTimeout = false;
+            }
           }
         }
       } else {
@@ -57,12 +95,6 @@ static void motorCommandReceiverTask(void* parameters) {
       }
     }
 
-    // Stop if the computer or Wi-Fi link stops sending fresh drive commands.
-    if (!stoppedForTimeout &&
-        millis() - lastCommandTime > COMMAND_TIMEOUT_MS) {
-      sendMotorCommand({0, 0});
-      stoppedForTimeout = true;
-    }
     // Poll frequently enough for responsive control and a prompt link timeout.
     vTaskDelay(pdMS_TO_TICKS(5));
   }
@@ -71,12 +103,12 @@ static void motorCommandReceiverTask(void* parameters) {
 bool startPS4Controller() {
   // The camera startup brings up the ESP32 access point before this listener.
   if (WiFi.getMode() == WIFI_OFF) {
-    Serial0.println("Wi-Fi must be started before motor command receiver");
+    Serial.println("Wi-Fi must be started before motor command receiver");
     return false;
   }
 
   if (commandSocket.begin(MOTOR_COMMAND_PORT) != 1) {
-    Serial0.println("Motor command UDP listener startup failed");
+    Serial.println("Motor command UDP listener startup failed");
     return false;
   }
 
@@ -93,11 +125,11 @@ bool startPS4Controller() {
   );
   if (result != pdPASS) {
     commandSocket.stop();
-    Serial0.println("Motor command receiver task creation failed");
+    Serial.println("Motor command receiver task creation failed");
     return false;
   }
 
-  Serial0.printf("Motor command listener ready on UDP port %u\n",
+  Serial.printf("Motor command listener ready on UDP port %u\n",
                  MOTOR_COMMAND_PORT);
   return true;
 }

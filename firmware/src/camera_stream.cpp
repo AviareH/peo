@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
+#include "ps4_controller.h"
 
 
 const char* wifiName = "PEO-Camera";
@@ -49,17 +50,28 @@ bool initializeCamera() {
   esp_err_t result = esp_camera_init(&config);
 
   if (result != ESP_OK) {
-    Serial0.printf("Camera initialization failed: 0x%x\n", result);
+    Serial.printf("Camera initialization failed: 0x%x\n", result);
     return false;
   }
 
-  Serial0.println("Camera initialized");
-  Serial0.printf("Password: %s\n", wifiPassword);
+  Serial.println("Camera initialized");
+  Serial.printf("Password: %s\n", wifiPassword);
   return true;
 }
 
 // Runs when a client opens /stream
 esp_err_t streamHandler(httpd_req_t* request) {
+  // Browser navigation opens the labelled viewer. Image and OpenCV clients
+  // keep the original MJPEG endpoint and receive unmodified camera pixels.
+  char accept[512] = {};
+  if (httpd_req_get_hdr_value_str(request, "Accept", accept, sizeof(accept)) == ESP_OK &&
+      strstr(accept, "text/html") && !strchr(request->uri, '?')) {
+    String location = "http://" + WiFi.softAPIP().toString() + ":81/";
+    httpd_resp_set_status(request, "302 Found");
+    httpd_resp_set_hdr(request, "Location", location.c_str());
+    httpd_resp_set_hdr(request, "Vary", "Accept");
+    return httpd_resp_send(request, nullptr, 0);
+  }
   esp_err_t result = httpd_resp_set_type(
       request,
       "multipart/x-mixed-replace; boundary=frame"
@@ -77,7 +89,7 @@ esp_err_t streamHandler(httpd_req_t* request) {
     camera_fb_t* frame = esp_camera_fb_get();
 
     if (frame == nullptr) {
-      Serial0.println("Camera capture failed");
+      Serial.println("Camera capture failed");
       return ESP_FAIL;
     }
 
@@ -88,7 +100,9 @@ esp_err_t streamHandler(httpd_req_t* request) {
         sizeof(header),
         "--frame\r\n"
         "Content-Type: image/jpeg\r\n"
+        "X-Drive-Mode: %s\r\n"
         "Content-Length: %u\r\n\r\n",
+        driveModeName(),
         static_cast<unsigned int>(frame->len)
     );
 
@@ -110,7 +124,7 @@ esp_err_t streamHandler(httpd_req_t* request) {
     esp_camera_fb_return(frame);
 
     if (result != ESP_OK) {
-      Serial0.println("Stream client disconnected");
+      Serial.println("Stream client disconnected");
       return result;
     }
 
@@ -118,19 +132,56 @@ esp_err_t streamHandler(httpd_req_t* request) {
   }
 }
 
+static esp_err_t modeHandler(httpd_req_t* request) {
+  httpd_resp_set_type(request, "text/plain");
+  httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+  return httpd_resp_sendstr(request, driveModeName());
+}
+
+static esp_err_t viewerHandler(httpd_req_t* request) {
+  static const char page[] = R"HTML(<!doctype html>
+<html lang="en"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PEO camera</title>
+<style>body{margin:0;background:#151515;color:white;font:600 18px system-ui}main{position:relative;width:fit-content;margin:auto}img{display:block;max-width:100vw;max-height:100vh}output{position:absolute;top:8px;left:8px;background:#111e;padding:4px 10px}</style>
+<main><img id="camera" alt="Robot camera"><output id="mode">Mode: UNKNOWN</output></main>
+<script>
+const stream = new URL('/stream?raw=1', location.href);
+stream.port = '80';
+document.getElementById('camera').src = stream;
+async function updateMode() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 600);
+  let mode = 'UNKNOWN';
+  try {
+    const result = await fetch('/mode', {cache:'no-store', signal:controller.signal});
+    const value = await result.text();
+    if (result.ok && ['MANUAL','AUTONOMOUS'].includes(value)) mode = value;
+  } catch (_) {} finally {
+    clearTimeout(timer);
+    document.getElementById('mode').textContent = 'Mode: ' + mode;
+    setTimeout(updateMode, 250);
+  }
+}
+updateMode();
+</script></html>)HTML";
+  httpd_resp_set_type(request, "text/html");
+  return httpd_resp_send(request, page, sizeof(page) - 1);
+}
 
 bool startStreamingServer() {
   // Pin the HTTP server to core 0, separate from motor control on core 1.
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.server_port = 80;
-    config.core_id = 0;
-    config.task_priority = 4;
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+  config.core_id = 0;
+  config.task_priority = 4;
+  config.max_open_sockets = 2;
+  config.lru_purge_enable = true;
 
   httpd_handle_t server = nullptr;
   esp_err_t result = httpd_start(&server, &config);
 
   if (result != ESP_OK) {
-    Serial0.printf("Server startup failed: 0x%x\n", result);
+    Serial.printf("Server startup failed: 0x%x\n", result);
     return false;
   }
 
@@ -143,12 +194,32 @@ bool startStreamingServer() {
   result = httpd_register_uri_handler(server, &streamRoute);
 
   if (result != ESP_OK) {
-    Serial0.printf("Stream route registration failed: 0x%x\n", result);
+    Serial.printf("Stream route registration failed: 0x%x\n", result);
     // Do not leave a server running without its stream endpoint.
     httpd_stop(server);
     return false;
   }
 
+  // A streaming handler occupies its HTTP worker for the lifetime of a client.
+  // Give read-only status and the viewer their own worker and control socket.
+  config.server_port = 81;
+  ++config.ctrl_port;
+  httpd_handle_t status = nullptr;
+  httpd_uri_t viewer = {};
+  viewer.uri = "/";
+  viewer.method = HTTP_GET;
+  viewer.handler = viewerHandler;
+  httpd_uri_t mode = {};
+  mode.uri = "/mode";
+  mode.method = HTTP_GET;
+  mode.handler = modeHandler;
+  if (httpd_start(&status, &config) != ESP_OK ||
+      httpd_register_uri_handler(status, &viewer) != ESP_OK ||
+      httpd_register_uri_handler(status, &mode) != ESP_OK) {
+    if (status) httpd_stop(status);
+    httpd_stop(server);
+    return false;
+  }
   return true;
 }
 
@@ -156,7 +227,7 @@ bool startStreamingServer() {
 bool startCameraStreaming() {
   // Camera frame buffers are allocated in PSRAM, so fail before Wi-Fi startup.
   if (!psramFound() || !initializeCamera()) {
-    Serial0.println("Camera or PSRAM initialization failed");
+    Serial.println("Camera or PSRAM initialization failed");
     return false;
   }
 
@@ -164,7 +235,7 @@ bool startCameraStreaming() {
   WiFi.mode(WIFI_AP);
 
   if (!WiFi.softAP("PEO-Camera", "peocamera123")) {
-    Serial0.println("Wi-Fi startup failed");
+    Serial.println("Wi-Fi startup failed");
     return false;
   }
 
@@ -172,8 +243,8 @@ bool startCameraStreaming() {
     return false;
   }
 
-  Serial0.print("Stream ready: http://");
-  Serial0.print(WiFi.softAPIP());
-  Serial0.println("/stream");
+  Serial.print("Stream ready: http://");
+  Serial.print(WiFi.softAPIP());
+  Serial.println("/stream");
   return true;
 }

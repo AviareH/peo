@@ -4,6 +4,9 @@ import argparse
 import math
 from pathlib import Path
 
+from tape import TapeSettings
+from tape_geometry import StepLimits
+
 from path_estimation import (DEFAULT_MARGIN, DEFAULT_ENDPOINT_MARGIN, DEFAULT_MIN_FORWARD,
                              DEFAULT_CORRIDOR_NEAR, DEFAULT_CORRIDOR_FAR, DEFAULT_CORRIDOR_BUFFER)
 
@@ -15,8 +18,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stream-timeout-ms", type=int, default=2000,
                         help="Live connection/read timeout (default: 2000 ms)")
     parser.add_argument("--max-frame-age-ms", type=int, default=2000,
-                        help="Maximum live frame age at receipt and after processing (default: 2000 ms)")
-    parser.add_argument("--method", choices=["classical", "semantic"], default="classical")
+                        help="Maximum local frame age for live input and tape proposals (default: 2000 ms)")
+    parser.add_argument("--method", choices=["classical", "semantic", "tape"], default="classical")
+    tape = parser.add_argument_group("corridor between two blue tape strips")
+    tape.add_argument("--tape-hsv-low", nargs=3, type=int, default=TapeSettings.hsv_low)
+    tape.add_argument("--tape-hsv-high", nargs=3, type=int, default=TapeSettings.hsv_high)
+    tape.add_argument("--tape-near-y", type=float, default=TapeSettings.near_y)
+    tape.add_argument("--tape-min-extent", type=float, default=TapeSettings.min_extent)
+    tape.add_argument("--tape-max-width", type=float, default=TapeSettings.max_width)
+    tape.add_argument("--tape-min-lane-width", type=float, default=TapeSettings.min_lane_width,
+                      help="Minimum visible space between strips, fraction of image width")
+    tape.add_argument("--tape-gap-px", type=int, choices=[0, 2, 4, 6, 8], default=TapeSettings.gap_px)
+    tape.add_argument("--calibration", type=Path, help="Tape image-to-ground calibration JSON")
+    actuation = tape.add_mutually_exclusive_group()
+    actuation.add_argument("--actuate", nargs=2, type=float, metavar=("TURN_MS_PER_RAD", "DRIVE_MS_PER_M"),
+                           help="Enable timed ESP32 motion for live calibrated tape tracking")
+    actuation.add_argument("--actuate-encoders", action="store_true",
+                           help="Enable ESP32 motion using configured wheel encoders")
+    tape.add_argument("--lookahead-m", type=float, default=StepLimits.lookahead_m)
+    tape.add_argument("--max-step-m", type=float, default=StepLimits.max_step_m)
+    tape.add_argument("--min-step-m", type=float, default=StepLimits.min_step_m)
+    tape.add_argument("--max-turn-deg", type=float, default=math.degrees(StepLimits.max_turn_rad))
+    tape.add_argument("--steering-deadband-deg", type=float, default=math.degrees(StepLimits.deadband_rad))
     parser.add_argument("--model", choices=["b0", "b2"], default="b0",
                         help="Pretrained SegFormer size for semantic mode (default: b0)")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
@@ -61,6 +84,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-area", type=float, default=.003, help="Fraction of ROI area")
     parser.add_argument("--min-edge-support", type=float, default=.08)
     args = parser.parse_args()
+    if args.method == "tape":
+        if args.depth or args.show_floor_sample:
+            parser.error("--depth and --show-floor-sample are incompatible with --method tape")
+        try:
+            args.tape_settings = TapeSettings(tuple(args.tape_hsv_low), tuple(args.tape_hsv_high),
+                                             args.roi_top, args.tape_near_y, args.min_area,
+                                             args.tape_min_extent, args.tape_max_width, args.tape_gap_px,
+                                             args.tape_min_lane_width)
+            args.step_limits = StepLimits(args.lookahead_m, args.max_step_m, args.min_step_m,
+                                         math.radians(args.max_turn_deg),
+                                         math.radians(args.steering_deadband_deg))
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.stream:
         from urllib.parse import urlsplit
         url = urlsplit(args.stream)
@@ -70,6 +106,11 @@ def parse_args() -> argparse.Namespace:
             parser.error("--stream cannot be combined with a video file or --start-seconds")
     if args.stream_timeout_ms <= 0 or args.max_frame_age_ms <= 0:
         parser.error("Stream timeout and maximum frame age must be positive")
+    if args.actuate is not None or args.actuate_encoders:
+        if args.method != "tape" or not args.stream or not args.calibration:
+            parser.error("Actuation requires --method tape, --stream and --calibration")
+    if args.actuate is not None and not all(math.isfinite(value) and value > 0 for value in args.actuate):
+        parser.error("--actuate needs positive, finite timing scales")
     if not (0 <= args.corridor_far <= args.corridor_near <= .6 and 0 <= args.corridor_buffer <= .1):
         parser.error("Corridor widths must be 0 <= far <= near <= .6; buffer must be 0.. .1")
     if not (.005 <= args.path_margin <= args.path_end_margin <= .25
@@ -84,7 +125,7 @@ def parse_args() -> argparse.Namespace:
     if args.method == "semantic" and args.show_floor_sample:
         parser.error("--show-floor-sample applies only to --method classical")
     x1, y1, x2, y2 = args.floor_patch
-    if not (0 <= args.roi_top < 1 and 0 <= x1 < x2 <= 1 and args.roi_top <= y1 < y2 <= 1):
+    if args.method != "tape" and not (0 <= args.roi_top < 1 and 0 <= x1 < x2 <= 1 and args.roi_top <= y1 < y2 <= 1):
         parser.error("ROI and floor patch must be ordered fractions in 0..1; patch must be within ROI")
     if not (args.max_width >= 64 and math.isfinite(args.start_seconds) and args.start_seconds >= 0
             and 0 < args.min_area < 1 and 0 <= args.min_edge_support <= 1
