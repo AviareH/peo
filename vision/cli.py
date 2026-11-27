@@ -36,7 +36,8 @@ def parse_args() -> argparse.Namespace:
     actuation.add_argument("--actuate-encoders", action="store_true",
                            help="Enable ESP32 motion using configured wheel encoders")
     tape.add_argument("--lookahead-m", type=float, default=StepLimits.lookahead_m)
-    tape.add_argument("--max-step-m", type=float, default=StepLimits.max_step_m)
+    tape.add_argument("--max-step-m", type=float,
+                      help="Maximum tape step in metres (default: 0.65 in dry run, 0.30 with actuation)")
     tape.add_argument("--min-step-m", type=float, default=StepLimits.min_step_m)
     tape.add_argument("--max-turn-deg", type=float, default=math.degrees(StepLimits.max_turn_rad))
     tape.add_argument("--steering-deadband-deg", type=float, default=math.degrees(StepLimits.deadband_rad))
@@ -87,6 +88,8 @@ def parse_args() -> argparse.Namespace:
     if args.method == "tape":
         if args.depth or args.show_floor_sample:
             parser.error("--depth and --show-floor-sample are incompatible with --method tape")
+        if args.max_step_m is None:
+            args.max_step_m = .30 if args.actuate is not None or args.actuate_encoders else StepLimits.max_step_m
         try:
             args.tape_settings = TapeSettings(tuple(args.tape_hsv_low), tuple(args.tape_hsv_high),
                                              args.roi_top, args.tape_near_y, args.min_area,

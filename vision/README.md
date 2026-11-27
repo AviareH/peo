@@ -25,7 +25,7 @@ Press **Q** to exit. Results save under `vision/outputs`.
 
 Tape mode treats the two blue strips as the left and right course boundaries. The desired route is midway between their **inside edges**. The course diagram gives a nominal 90 cm track width. Camera calibration supplies the pixel-to-ground mapping. Tape mode bases each proposal on the visible local lane, including at bends and beside a neighbouring lane.
 
-The debug view shows the prepared camera image, the annotated corridor, and the cleaned mask. Green highlights the two selected strips. Short cross-lines show how the inside edges are paired, yellow traces their midpoints, and magenta marks the target. The footer shows the robot's turning reference with forward pointing up. Tape mode defaults to dry-run.
+The debug view shows the prepared camera image, the annotated corridor, and the cleaned mask. Green highlights the two selected strips. Short cross-lines show how the inside edges are paired, yellow traces their midpoints, and magenta marks the target. The footer shows the proposed command and the robot's turning reference. An image-only `FORWARD` hint describes the visible corridor and carries no motor command. Tape mode defaults to dry-run.
 
 Run these PowerShell commands from the repository root to open the file picker in `vision/footage`. Choose a recording to start the preview. Each run gets a fresh output directory.
 
@@ -80,11 +80,11 @@ Existing version 1 files can also supply a fitted matrix in `image_to_ground_m`.
 
 ### Read a movement proposal
 
-For each cross-section, both inside edges must lie in the measured patch. The planner projects the two edges into metres and averages their ground positions. Starting at the first supported midpoint, the planner walks up to `--lookahead-m .20` along the ground route. It stops at the first exit, visible endpoint or intersection with the `--max-step-m .30` radius. When there is enough measured approach left for a separate step, the first target stays on that approach. A fresh frame can choose a turning target once the bend is closer. Targets must lie ahead of the turn centre. An unreachable first point, turn over `--max-turn-deg 40`, or drive under `--min-step-m .03` yields STOP.
+For each cross-section, both inside edges must lie in the measured patch. The planner projects the two edges into metres and averages their ground positions. Starting at the first supported midpoint, the planner walks up to `--lookahead-m .20` along the ground route. It stops at the first exit, visible endpoint or intersection with the `--max-step-m` radius. The default radius is 0.65 m in dry run and 0.30 m with actuation. The ESP32 accepts encoder drive commands up to 300 mm. When there is enough measured approach left for a separate step, the first target stays on that approach. A fresh frame can choose a turning target once the bend is closer. Targets must lie ahead of the turn centre. An unreachable first point, turn over `--max-turn-deg 40`, or drive under `--min-step-m .03` yields STOP.
 
 For target `[left, forward]`, the ordered actions are **TURN** by `atan2(left, forward)` radians (positive left), then **DRIVE** by `hypot(left, forward)` metres. The drive uses the straight line from the robot to the target. Inside `--steering-deadband-deg 2` the proposed turn is zero, accepting a small lateral error. Validate these starting distances and angles against the camera visibility and how far the robot actually moves. A straight drive that crosses either measured tape edge produces STOP. Obstacle and chassis clearance still require separate checks.
 
-For a single outside elbow, the direction comes from the visible outgoing arm inside the calibration patch. The proposal turns in place up to `--max-turn-deg` and waits for a fresh frame after completion.
+For a single outside elbow, the incoming tape can enter through the side of the frame just above the near-field line. A clearly measured outgoing arm gives a turn in place up to `--max-turn-deg`. When the measured arm is short, a single continuous strip entering from the side and sloping inward can still support an estimated pivot away from that side. The pivot is limited to 12° or `--max-turn-deg`, whichever is smaller. It requires a matching camera calibration and carries zero forward distance. After either pivot, live control waits for a fresh frame before planning again.
 
 The MP4 and `*_detections.jsonl` are written together. To inspect the first few proposals from the replay above, run
 
@@ -112,7 +112,7 @@ The live overlay and frame records show the ESP32's latest reported drive mode. 
   --method tape --calibration vision/camera_calibration.json --preview --actuate-encoders
 ```
 
-4. Press **Share** to enter autonomous. Press it again for manual, or press **Q** in the preview to end CV control. A lost tape pair, incompatible camera calibration, or stale frame causes a stop. Live actuation also limits frame age to 250 ms from laptop decode. The board stops if vision stalls while the PS4 remains connected. The JSONL `esp32_control` record includes the requested move and the board's state. [Firmware controls and protocol](../firmware/README.md#cv-movement-protocol)
+4. The preview starts disarmed. Press **A** in the preview to arm CV and **Share** on the controller to enter autonomous. Both are required for CV motion. Press **S** to stop and disarm CV while keeping the preview open, **Q** or **Esc** to stop and quit, or **Share** to stop CV motion and return to manual. Headless actuation uses the controller mode as its enable. A lost tape pair, incompatible camera calibration, or stale frame causes a stop. Live actuation limits frame age to 250 ms from laptop decode. The board stops if vision stalls while the PS4 remains connected. The JSONL `esp32_control` record includes the requested move and the board's state. [Firmware controls and protocol](../firmware/README.md#cv-movement-protocol)
 
 For timed trials, supply the measured duration in milliseconds per radian of turn and milliseconds per metre forward. Measure short trial moves at the firmware's drive setting on the intended floor to refine the scales. The log records requested phase durations. Timing varies with the load, battery and floor.
 

@@ -1,10 +1,14 @@
 """Dry-run protocol objects and a single replaceable, expiring preview slot."""
 
 from dataclasses import dataclass, field, replace
+import math
 from time import monotonic
 
 from tape import TapeRoute
 from tape_geometry import Calibration, StepLimits, plan_between_edges, plan_boundary_turn
+
+
+EDGE_TURN_RAD = math.radians(12)
 
 
 @dataclass(frozen=True)
@@ -46,14 +50,23 @@ class Proposal:
 
 def propose(base: Proposal, route: TapeRoute, cal: Calibration | None, limits: StepLimits):
     result = replace(base, detection=route.status, quality_heuristic=route.evidence.quality)
-    if route.status not in ("tracked", "turn_only"):
+    if route.status not in ("tracked", "turn_only", "edge_turn"):
         return result.stop(route.status)
     if cal is None or result.calibration != "valid":
         return result.stop("calibration_" + result.calibration)
-    try:
-        if route.status == "turn_only":
+    if route.status == "turn_only":
+        try:
             angle = plan_boundary_turn(route.turn_arm, route.turn_direction, cal, limits)
+        except ValueError as exc:
+            if not route.can_estimate_turn or str(exc) not in (
+                    "corner_outside_calibrated_region", "insufficient_measured_turn_arm"):
+                return result.stop(str(exc))
+        else:
             return replace(result, status="PROPOSED", reason="dry_run", actions=(Turn(angle),))
+    if route.status in ("turn_only", "edge_turn"):
+        angle = -route.turn_direction * min(EDGE_TURN_RAD, limits.max_turn_rad)
+        return replace(result, status="PROPOSED", reason="estimated_edge_turn", actions=(Turn(angle),))
+    try:
         step = plan_between_edges(route.left_edge, route.right_edge, cal, limits,
                                   approach_end=route.approach_end)
     except ValueError as exc:

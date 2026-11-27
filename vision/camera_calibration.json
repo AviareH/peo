@@ -5,16 +5,16 @@
   "processed_size": [640, 480],
   "rotate": 0,
   "valid_image_quad_px": [
-    [null, null],
-    [null, null],
-    [null, null],
-    [null, null]
+    [210, 307],
+    [416, 312],
+    [509, 392],
+    [60, 385]
   ],
   "ground_quad_left_forward_m": [
-    [null, null],
-    [null, null],
-    [null, null],
-    [null, null]
+    [1.06, 0.33],
+    [1.09, -0.35],
+    [0.60, -0.31],
+    [0.58, 0.36]
   ],
   "camera_offset_left_forward_m": [0, 0]
 }

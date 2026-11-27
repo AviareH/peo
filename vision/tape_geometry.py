@@ -104,7 +104,7 @@ class Calibration:
 @dataclass(frozen=True)
 class StepLimits:
     lookahead_m: float = .20
-    max_step_m: float = .30
+    max_step_m: float = .65
     min_step_m: float = .03
     max_turn_rad: float = math.radians(40)
     deadband_rad: float = math.radians(2)

@@ -86,10 +86,13 @@ def open_preview(width: int, height: int) -> None:
     cv2.resizeWindow(PREVIEW_TITLE, round(width * scale), round(height * scale))
 
 
-def preview_stopped(overlay: np.ndarray, fps: float, live: bool = False, allow_pause: bool = True) -> bool:
-    """Show a frame; space waits for another key, Q/Esc exits replay."""
+def preview_key(overlay: np.ndarray, fps: float, live: bool = False, allow_pause: bool = True) -> int:
     cv2.imshow(PREVIEW_TITLE, overlay)
     key = cv2.waitKey(1 if live else max(1, round(1000 / fps))) & 0xFF
     if allow_pause and key == ord(" "):
         key = cv2.waitKey(0) & 0xFF
-    return key in (ord("q"), 27)
+    return key
+
+
+def preview_stopped(overlay: np.ndarray, fps: float, live: bool = False, allow_pause: bool = True) -> bool:
+    return preview_key(overlay, fps, live, allow_pause) in (ord("q"), ord("Q"), 27)

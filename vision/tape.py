@@ -54,6 +54,7 @@ class TapeRoute:
     approach_end: int | None = None  # last inbound cross-section before the turn
     turn_arm: tuple[tuple[int, int], ...] = ()  # observed pixels in travel order for a turn in place
     short_pair: bool = False
+    can_estimate_turn: bool = False
 
 
 def _boundary_elbow(component):
@@ -65,37 +66,108 @@ def _boundary_elbow(component):
     widths = right - left + 1
     typical = np.median(widths)
     gaps = widths - component.sum(axis=1) > max(2, .15 * typical)
-    broad = np.flatnonzero(widths > 2.5 * typical + 2)
+    split_rows = max(3, min(8, round(.30 * typical)))
+    broad = widths > 2.5 * typical + 2
+    # A slanted far arm can be narrow on each row despite spanning much of
+    # the image. Look for a sustained sideways sweep relative to the stem.
+    centers = (left + right) / 2
+    sweep = np.abs(centers[4:] - centers[:-4]) / 4
+    if len(sweep) >= 6:
+        fast = sweep > max(3, 2 * np.median(sweep[len(sweep)//2:]))
+        coherent = fast[:-2] & fast[1:-1] & fast[2:]
+        broad[3:-3] |= coherent & (np.arange(3, len(widths)-3) < .60 * len(widths))
+    broad = np.flatnonzero(broad)
     if not len(broad):
-        return bool(gaps.any()), None
-    # Compare against the stem just below the arm. Further down, perspective
-    # shifts a slanted stem sideways and makes a single arm look two-sided.
+        return np.count_nonzero(gaps) >= split_rows, None
+    # Compare against the stem at the bend, where perspective has had the
+    # least chance to shift the strip sideways.
     stem = min(len(widths) - 1, broad[-1] + 1)
-    if (gaps[stem:].any() or broad[-1] - broad[0] > 2 * typical or
+    if (np.count_nonzero(gaps[stem:]) >= split_rows or
+            broad[-1] - broad[0] > max(2 * typical, .40 * len(widths)) or
             (broad[0] > typical and len(widths) - stem > typical)):
         return True, None
-    widest = int(widths.argmax())
-    extends_left = left[widest] < left[stem] - typical
-    extends_right = right[widest] > right[stem] + typical
+    extends_left = left[:stem+1].min() < left[stem] - typical
+    extends_right = right[:stem+1].max() > right[stem] + typical
     if extends_left and extends_right:
         return True, None
     if extends_left or extends_right:
         direction = -1 if extends_left else 1
         x = right[stem] if extends_left else left[stem]
         return False, (direction, int(cols.min() + x), int(rows.min() + stem))
-    return bool(gaps.any()), None
+    return np.count_nonzero(gaps) >= split_rows, None
 
 
-def _recover_far_tape(hsv, labels, stats, anchors, cfg, frame_height):
-    """Keep faint horizontal tape only where it connects to a seeded far tip."""
+def _trim_clipped_boundary(component, side, seed_y):
+    """Recover a straight inner edge when clutter fans out at the near image border."""
+    rows = np.flatnonzero(component.any(axis=1))
+    height = rows[-1] - rows[0] + 1
+    cutoff = rows[0] + round(.60 * height)
+    border = 0 if side == 0 else -1
+    if not component[cutoff:, border].any() or cutoff >= seed_y:
+        return None
+
+    # Use inward-increasing coordinates on both sides. Fit only the upper,
+    # unbranched stem, then check that the visible inner edge keeps that line.
+    inward = component if side == 0 else component[:, ::-1]
+    edge = np.where(inward.any(axis=1), inward.shape[1] - 1 - inward[:, ::-1].argmax(axis=1), -1)
+    stem = rows[(rows >= rows[0] + round(.10 * height)) & (rows < rows[0] + round(.45 * height))]
+    if len(stem) < 6 or _boundary_elbow(inward[:cutoff])[0]:
+        return None
+    tolerance = max(3, float(np.median(inward[stem].sum(axis=1))))
+    slope, intercept = np.polyfit(stem, edge[stem], 1)
+    expected = slope * np.arange(len(inward)) + intercept
+    upper = rows[(rows >= stem[0]) & (rows < cutoff)]
+    shared = np.arange(cutoff, seed_y + 1)
+    if (slope >= 0 or np.any(np.abs(edge[upper] - expected[upper]) > .65 * tolerance) or
+            np.any(np.abs(edge[shared] - expected[shared]) > tolerance)):
+        return None
+
+    # Trim only outward from the observed inner edge. A branch into the
+    # corridor fails the line check above instead of being edited out.
+    trimmed = inward.copy()
+    columns = np.arange(inward.shape[1])
+    trimmed[cutoff:seed_y+1] &= columns >= edge[shared, None] - 2 * tolerance
+    trimmed[seed_y+1:] = False
+    if _boundary_elbow(trimmed)[0]:
+        return None
+    return trimmed if side == 0 else trimmed[:, ::-1]
+
+
+def _color_masks(hsv, cfg):
     hue, saturation, value = cfg.hsv_low
+    raw = cv2.inRange(hsv, cfg.hsv_low, cfg.hsv_high)
+    # Chroma is the difference between the brightest and darkest channels.
+    # Compare it with the local floor color to suppress broad blue casts.
+    chroma = cv2.multiply(hsv[:, :, 1], hsv[:, :, 2], scale=1 / 255)
+    size = max(9, 2 * round(hsv.shape[1] / 65) + 1)
+    contrast = cv2.morphologyEx(chroma, cv2.MORPH_TOPHAT, np.ones((size, size), np.uint8))
+    strong = raw & ((contrast >= 10) | (chroma >= 70)).astype(np.uint8) * 255
     weak = cv2.inRange(hsv, (hue, min(saturation, max(24, round(.30 * saturation))), value),
                        cfg.hsv_high)
+    weak &= ((contrast >= 8) & (chroma >= 12)).astype(np.uint8) * 255
+    return strong, weak
+
+
+def _join_gaps(mask, gap_px):
+    if not gap_px:
+        return mask
+    size = 2 * (gap_px // 2) + 1
+    # Close each orientation independently. Zero padding keeps a gap at the
+    # image edge from being filled without a pixel on both sides.
+    return mask | cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((size, 1), np.uint8),
+                                   borderType=cv2.BORDER_CONSTANT, borderValue=0) | cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, np.ones((1, size), np.uint8),
+        borderType=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+def _recover_far_tape(weak, labels, stats, anchors, cfg, frame_height):
+    """Keep faint horizontal tape only where it connects to a seeded far tip."""
     width = labels.shape[1]
-    # A small horizontal gap can appear at a narrow, compressed far corner.
-    gap = 2 * (width // 90) + 1 if cfg.gap_px else 1
-    joined = cv2.morphologyEx(weak, cv2.MORPH_CLOSE, np.ones((1, gap), np.uint8))
-    length = max(9, 2 * (width // 110) + 1)
+    max_thickness = max(3, round(.018 * frame_height))
+    broad = cv2.morphologyEx(weak, cv2.MORPH_OPEN, np.ones((max_thickness + 1, 1), np.uint8))
+    thin = weak & ~broad
+    joined = _join_gaps(thin, cfg.gap_px)
+    length = max(5, 2 * (width // 240) + 1)
     arms = cv2.morphologyEx(joined, cv2.MORPH_OPEN, np.ones((1, length), np.uint8))
     recovered = np.zeros_like(weak)
     for (x, y), label in anchors:
@@ -143,16 +215,21 @@ def _clipped_boundaries(labels, stats, eligible, start):
     return clipped
 
 
-def _single_seed(labels, stats, near, eligible, max_tape):
+def _single_seed(labels, stats, start, eligible, max_tape, *, clipped_stem=False):
     if len(eligible) != 1:
         return None
     label = next(iter(eligible))
     _, top, _, height, _ = stats[label]
-    for y in range(top+height-1, near-1, -1):
+    for y in range(top+height-1, start-1, -1):
         xs = np.flatnonzero(labels[y] == label)
         axis = labels.shape[1] // 2
         if len(xs) and len(xs) <= max_tape and (xs[-1] < axis or xs[0] > axis):
-            return (int(xs[-1] if xs[-1] < axis else xs[0]), y), label
+            on_left = xs[-1] < axis
+            if clipped_stem:
+                border = 0 if on_left else -1
+                if not (labels[max(start, y-max(3, height//10)):y+1, border] == label).any():
+                    continue
+            return (int(xs[-1] if on_left else xs[0]), y), label
     return None
 
 
@@ -214,38 +291,91 @@ def _arm_rows(labels, observed, label, end, inner):
     return np.where(arm.any(axis=0), rows, -1)
 
 
-def _single_turn(route, labels, raw, anchor, label, top, near):
-    """Suggest an in-place turn from a clearly visible outside elbow."""
-    component = labels == label
-    split, elbow = _boundary_elbow(component)
-    if split:
-        route.status = "ambiguous_split_boundary"
-        return route
+def _outside_elbow_arm(labels, raw, anchor, label, elbow):
     if elbow is None:
-        return route
+        return (), 0.
     width = labels.shape[1]
     axis = width // 2
     direction, x, y = elbow
     if any(direction * (column-axis) >= -max(2, .04 * width) for column in (anchor[0], x)):
-        return route
+        return (), 0.
     rows = _arm_rows(labels, raw, label, y, False)
     end = -1 if direction < 0 else width
     xs = np.arange(x, end, direction)
     missing = np.flatnonzero(rows[xs] < 0)
     xs = xs[:missing[0]] if len(missing) else xs
     if len(xs) < .25 * width or direction * (xs[-1]-axis) < .05 * width:
-        return route
+        return (), 0.
     ys = rows[xs]
     observed = raw[ys, xs] != 0
     if observed.mean() < .85 or np.ptp(ys) > .20 * len(xs):
-        return route
-    route.turn_arm = tuple(zip(xs[observed].tolist(), (ys[observed] + top).tolist()))
-    route.selected[top:][component] = 255
+        return (), 0.
+    return tuple(zip(xs[observed].tolist(), ys[observed].tolist())), float(observed.mean())
+
+
+def _side_entering_arm(component, raw, anchor):
+    """Follow a single connected strip inwards from the side it enters."""
+    height, width = component.shape
+    x, y = anchor
+    from_left = x < width // 2
+    inward = component if from_left else component[:, ::-1]
+    end = np.flatnonzero(inward.any(axis=0))[-1] + 1
+    near_rows = slice(max(0, y - max(3, round(.07 * height))), y + 1)
+    if end < .18 * width or not inward[near_rows, 0].any():
+        return (), 0.
+
+    pixels = inward[:, :end]
+    top = pixels.argmax(axis=0)
+    bottom = height - 1 - pixels[::-1].argmax(axis=0)
+    span = bottom - top + 1
+    gaps = span - pixels.sum(axis=0)
+    if (np.count_nonzero(gaps > max(3, .012 * height)) > max(2, .035 * end) or
+            np.median(span) > max(8, .06 * height)):
+        return (), 0.
+
+    # Evaluate the near-to-far shape in short sections so stray pixels and
+    # thick tape at the frame edge have little influence on its heading.
+    centers = (top + bottom) / 2
+    rows = np.array([np.median(section) for section in np.array_split(centers, min(8, end))])
+    rise = rows[0] - rows[-1]
+    if (rise < max(3, .03 * height) or rise > .75 * end or
+            np.any(np.diff(rows) > max(3, .02 * height))):
+        return (), 0.
+    if end >= .85 * width and (rows[0] - rows[1]) - (rows[-2] - rows[-1]) < .02 * end:
+        return (), 0.  # A straight crossing that exits both sides has no unique turn.
+
+    observed = (pixels & ((raw if from_left else raw[:, ::-1])[:, :end] != 0))
+    visible = observed.any(axis=0)
+    support = float(visible.mean())
+    if support < .80:
+        return (), support
+    ys = height - 1 - observed[::-1].argmax(axis=0)
+    xs = np.arange(end) if from_left else width - 1 - np.arange(end)
+    return tuple(zip(xs[visible].tolist(), ys[visible].tolist())), support
+
+
+def _single_turn(route, labels, raw, anchor, label, top, near, full_extent):
+    component = labels == label
+    split, elbow = _boundary_elbow(component)
+    side_arm, support = _side_entering_arm(component, raw, anchor)
     stem_rows = np.flatnonzero(component.any(axis=1))
-    near_support = (component[near:] & (raw[near:] != 0)).any(axis=1).mean()
-    route.evidence = Evidence(len(stem_rows) / len(labels), float(observed.mean()), float(near_support))
-    route.turn_direction = direction
-    route.status = "turn_only"
+    arm, arm_support = (), 0.
+    if len(stem_rows) >= full_extent:
+        arm, arm_support = _outside_elbow_arm(labels, raw, anchor, label, elbow)
+    if not arm and not side_arm:
+        if split:
+            route.status = "ambiguous_split_boundary"
+        return route
+    route.can_estimate_turn = bool(side_arm)
+    route.status = "turn_only" if arm else "edge_turn"
+    route.turn_direction = elbow[0] if arm else (1 if anchor[0] < labels.shape[1] // 2 else -1)
+    route.turn_arm = tuple((x, y + top) for x, y in (arm or side_arm))
+    route.selected[top:][component & (raw != 0)] = 255
+    y_anchor = anchor[1]
+    near_rows = slice(near, None) if arm and y_anchor >= near else slice(
+        max(0, y_anchor - max(3, round(.08 * len(labels)))), y_anchor + 1)
+    near_support = (component[near_rows] & (raw[near_rows] != 0)).any(axis=1).mean()
+    route.evidence = Evidence(len(stem_rows) / len(labels), arm_support if arm else support, float(near_support))
     return route
 
 
@@ -288,29 +418,38 @@ def _trace_corner(labels, observed, ids, inbound, elbows, min_width):
         corner.append((near, far) if inner == 0 else (far, near))
     if len(corner) < 3:
         return inbound, 0, None
-    # Keep only the approach that precedes the inside elbow. The new samples
-    # start at the bend and run toward the visible end of the paired arms.
+    # Follow the outside stem around the inside elbow before sweeping along
+    # the arms. Each crossing still has to meet two observed strips.
     incoming_y = inbound.mean(axis=1)[:, 1]
     after_elbow = np.flatnonzero(incoming_y < inner_top)
     count = int(after_elbow[0]) if len(after_elbow) else len(inbound)
-    if not count:
+    pivot = (inner_x, int(inside_rows[inner_x]))
+    if pivot[1] < 0:
         return inbound, 0, None
-    return np.concatenate((inbound[:count], corner)), direction, count - 1
+    sweep = []
+    start = int(inbound[max(0, count-1), outer, 1]) - (step if count else 0)
+    for y in range(start, outer_top, -step):
+        xs = np.flatnonzero(labels[y] == ids[outer])
+        if not len(xs):
+            return inbound, 0, None
+        edge = (int(xs[0] if direction < 0 else xs[-1]), y)
+        if np.hypot(edge[0]-pivot[0], edge[1]-pivot[1]) < min_width or not _clear_crossing(labels, pivot, edge):
+            return inbound, 0, None
+        sweep.append((pivot, edge) if inner == 0 else (edge, pivot))
+    return np.asarray(inbound[:count].tolist() + sweep + corner), direction, count - 1 if count else None
 
 
 def detect_tape(frame: np.ndarray, cfg: TapeSettings) -> TapeRoute:
     height, width = frame.shape[:2]
     top, near = int(cfg.roi_top * height), int(cfg.near_y * height)
     hsv = cv2.cvtColor(frame[top:], cv2.COLOR_BGR2HSV)
-    raw = cv2.inRange(hsv, tuple(cfg.hsv_low), tuple(cfg.hsv_high))
-    clean = cv2.morphologyEx(raw, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    if cfg.gap_px:
-        # Odd, centred kernel. Only bridge short, vertically aligned breaks.
-        size = 2 * (cfg.gap_px // 2) + 1
-        clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, np.ones((size, 1), np.uint8),
-                                 borderType=cv2.BORDER_REPLICATE)
+    raw, weak = _color_masks(hsv, cfg)
+    # A thin strip can have only one pixel across it. Require neighbors
+    # without eroding away a line or displacing its inside edge.
+    support = cv2.boxFilter((raw != 0).astype(np.uint8), -1, (3, 3), normalize=False,
+                            borderType=cv2.BORDER_REPLICATE)
+    clean = _join_gaps(np.where(support >= 3, raw, 0).astype(np.uint8), cfg.gap_px)
     mask = np.zeros((height, width), np.uint8)
-    mask[top:] = clean
     _, labels, stats, _ = cv2.connectedComponentsWithStats(clean, connectivity=8)
     route = TapeRoute("no_reliable_tape", mask, np.zeros_like(mask))
     areas = stats[:, cv2.CC_STAT_AREA]
@@ -324,11 +463,15 @@ def detect_tape(frame: np.ndarray, cfg: TapeSettings) -> TapeRoute:
     eligible = {i for i in near_ids if stats[i, 3] >= full_extent}
     min_width = max(3, cfg.min_lane_width * width)
     max_tape = cfg.max_width * width
+    start = max(0, near - round(.20 * len(clean)))
+    clipped = _clipped_boundaries(labels, stats, candidates, start)
+    display = np.zeros(len(stats), bool)
+    display[list(near_ids | clipped)] = True
+    mask[top:] = display[labels].astype(np.uint8) * 255
     seed, status = _seed(labels, near, eligible, min_width, max_tape)
-    short_pair = False
+    short_pair = (seed is not None and bool(clipped.intersection(seed[2])) and
+                  seed[0][1] - near + 1 < .15 * (len(clean) - near))
     if seed is None and status == "missing_boundary_pair":
-        start = max(0, near - round(.20 * len(clean)))
-        clipped = _clipped_boundaries(labels, stats, candidates, start)
         seed, status = _seed(labels, start, near_ids | clipped, min_width, max_tape,
                              near=near, clipped=clipped)
         short_pair = seed is not None
@@ -337,11 +480,12 @@ def detect_tape(frame: np.ndarray, cfg: TapeSettings) -> TapeRoute:
         route.status = status if near_ids or status != "missing_boundary_pair" else route.status
         if status != "missing_boundary_pair":
             return route
-        single = _single_seed(labels, stats, near, near_ids, max_tape)
-        if single is None or single[1] not in eligible:
+        single = _single_seed(labels, stats, near if near_ids else start, near_ids | clipped,
+                              max_tape, clipped_stem=not near_ids)
+        if single is None:
             return route
     anchors = (single,) if single else tuple(zip(seed[:2], seed[2]))
-    recovered, faint_observed = _recover_far_tape(hsv, labels, stats, anchors, cfg, height)
+    recovered, faint_observed = _recover_far_tape(weak, labels, stats, anchors, cfg, height)
     if recovered.any():
         _, labels = cv2.connectedComponents(((labels != 0) | (recovered != 0)).astype(np.uint8),
                                             connectivity=8)
@@ -349,19 +493,23 @@ def detect_tape(frame: np.ndarray, cfg: TapeSettings) -> TapeRoute:
         raw |= faint_observed
     ids = tuple(int(labels[y, x]) for (x, y), _ in anchors)
     if single:
-        return _single_turn(route, labels, raw, single[0], ids[0], top, near)
+        return _single_turn(route, labels, raw, single[0], ids[0], top, near, full_extent)
     if ids[0] == ids[1]:
         route.status = "ambiguous_joined_boundaries"
         return route
     seed = (*seed[:2], ids)
+    components = [labels == label for label in ids]
+    route.selected[top:][(components[0] | components[1]) & (raw != 0)] = 255
     elbows = []
-    for label in seed[2]:
-        component = labels == label
-        route.selected[top:][component] = 255
+    for side, component in enumerate(components):
         split, elbow = _boundary_elbow(component)
         if split:
-            route.status = "ambiguous_split_boundary"
-            return route
+            trimmed = _trim_clipped_boundary(component, side, seed[side][1])
+            if trimmed is None:
+                route.status = "ambiguous_split_boundary"
+                return route
+            labels[component & ~trimmed] = 0
+            route.selected[top:][component & ~trimmed] = 0
         elbows.append(elbow)
     pairs = _trace(labels, seed, min_width)
     pairs, direction, approach_end = _trace_corner(labels, raw, seed[2], pairs, elbows, min_width)
@@ -379,7 +527,8 @@ def detect_tape(frame: np.ndarray, cfg: TapeSettings) -> TapeRoute:
     for label in seed[2]:
         near_support &= ((labels[near_rows] == label) & (raw[near_rows] != 0)).any(axis=1)
     route.evidence = Evidence(extent, float(observed.mean()), float(near_support.mean()))
-    if (extent * len(clean) < short_extent or len(pairs) < 3 or route.evidence.continuity < .85
+    min_overlap = max(4, (.28 if short_pair else .40) * full_extent)
+    if (extent * len(clean) < min_overlap or len(pairs) < 3 or route.evidence.continuity < .85
             or route.evidence.near_support < .15):
         route.status = "insufficient_boundary_overlap"
         return route

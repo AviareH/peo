@@ -130,3 +130,15 @@ class DriveSinkTests(unittest.TestCase):
         self.assertTrue(self.socket.send.call_args.args[0].startswith(b"CV,"))
         self.assertGreater(self.sent()[2], move)
         self.assertEqual(self.sent()[3:], (0, 0))
+
+    def test_estimated_edge_turn_is_sent_as_an_encoder_pivot(self):
+        self.sink.close()
+        self.sink = Esp32DriveSink("board", clock=lambda: self.now)
+        self.addCleanup(self.sink.close)
+        self.arm()
+        self.now += .04
+        estimate = Proposal("run:frame", 1, self.now - .01, self.now + 1, "valid",
+                            status="PROPOSED", reason="estimated_edge_turn", actions=(Turn(-.20944),))
+        self.assertEqual(self.sink.publish(estimate).reason, "estimated_edge_turn")
+        self.assertTrue(self.socket.send.call_args.args[0].startswith(b"ENC,"))
+        self.assertEqual(self.sent()[3:], (-209, 0))

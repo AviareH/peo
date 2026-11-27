@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
+#include "as5600.h"
 #include "ps4_controller.h"
 
 
@@ -54,6 +55,16 @@ bool initializeCamera() {
     return false;
   }
 
+  // The camera is mounted upside down. Reverse both sensor axes for a 180° rotation.
+  sensor_t* sensor = esp_camera_sensor_get();
+  if (sensor == nullptr ||
+      sensor->set_hmirror(sensor, !sensor->status.hmirror) != 0 ||
+      sensor->set_vflip(sensor, !sensor->status.vflip) != 0) {
+    Serial.println("Camera orientation setup failed");
+    esp_camera_deinit();
+    return false;
+  }
+
   Serial.println("Camera initialized");
   Serial.printf("Password: %s\n", wifiPassword);
   return true;
@@ -62,7 +73,7 @@ bool initializeCamera() {
 // Runs when a client opens /stream
 esp_err_t streamHandler(httpd_req_t* request) {
   // Browser navigation opens the labelled viewer. Image and OpenCV clients
-  // keep the original MJPEG endpoint and receive unmodified camera pixels.
+  // keep the MJPEG endpoint and receive JPEGs directly from the camera.
   char accept[512] = {};
   if (httpd_req_get_hdr_value_str(request, "Accept", accept, sizeof(accept)) == ESP_OK &&
       strstr(accept, "text/html") && !strchr(request->uri, '?')) {
@@ -136,6 +147,24 @@ static esp_err_t modeHandler(httpd_req_t* request) {
   httpd_resp_set_type(request, "text/plain");
   httpd_resp_set_hdr(request, "Cache-Control", "no-store");
   return httpd_resp_sendstr(request, driveModeName());
+}
+
+static esp_err_t encoderHandler(httpd_req_t* request) {
+  const auto diagnostics = readEncoderDiagnostics();
+  const auto& sample = diagnostics.sample;
+  char response[256];
+  const int length = snprintf(response, sizeof(response),
+      "{\"left\":{\"status\":\"%s\",\"count\":%lld},"
+      "\"right\":{\"status\":\"%s\",\"count\":%lld},\"sample_age_ms\":%lu}\n",
+      encoderStateName(diagnostics.left), sample.left,
+      encoderStateName(diagnostics.right), sample.right,
+      static_cast<unsigned long>(millis() - sample.sampledAt));
+  if (length < 0 || length >= static_cast<int>(sizeof(response))) {
+    return httpd_resp_send_500(request);
+  }
+  httpd_resp_set_type(request, "application/json");
+  httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+  return httpd_resp_send(request, response, length);
 }
 
 static esp_err_t viewerHandler(httpd_req_t* request) {
@@ -213,9 +242,14 @@ bool startStreamingServer() {
   mode.uri = "/mode";
   mode.method = HTTP_GET;
   mode.handler = modeHandler;
+  httpd_uri_t encoders = {};
+  encoders.uri = "/encoders";
+  encoders.method = HTTP_GET;
+  encoders.handler = encoderHandler;
   if (httpd_start(&status, &config) != ESP_OK ||
       httpd_register_uri_handler(status, &viewer) != ESP_OK ||
-      httpd_register_uri_handler(status, &mode) != ESP_OK) {
+      httpd_register_uri_handler(status, &mode) != ESP_OK ||
+      httpd_register_uri_handler(status, &encoders) != ESP_OK) {
     if (status) httpd_stop(status);
     httpd_stop(server);
     return false;

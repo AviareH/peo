@@ -92,6 +92,18 @@ class DetectionTests(unittest.TestCase):
             self.assertIn("ambiguous", route.status)
             self.assertFalse(route.points)
 
+    def test_outside_clutter_at_clipped_near_edge_leaves_the_straight_lane(self):
+        frame = np.zeros((480, 640, 3), np.uint8)
+        cv2.line(frame, (0, 397), (232, 265), (255, 0, 0), 11)
+        cv2.line(frame, (639, 397), (407, 265), (255, 0, 0), 11)
+        cv2.line(frame, (54, 365), (0, 367), (255, 0, 0), 5)
+        for image in (frame, cv2.flip(frame, 1)):
+            route = detect_tape(image, TapeSettings())
+            self.assertEqual((route.status, route.turn_direction), ("tracked", 0))
+            self.assertTrue(all(abs(x - 320) < 5 for x, _ in route.points))
+        cv2.line(frame, (54, 365), (132, 338), (255, 0, 0), 5)
+        self.assertEqual(detect_tape(frame, TapeSettings()).status, "ambiguous_split_boundary")
+
     def test_single_strip_and_pair_on_same_side_stop(self):
         for frame in (strip((50, 119), (50, 42)), strip((110, 119), (110, 42)),
                       lane((38, 119), (38, 42))):
@@ -111,6 +123,26 @@ class DetectionTests(unittest.TestCase):
         outward = strip((145, 119), (107, 72), (159, 72))
         self.assertEqual(detect_tape(outward, TapeSettings()).status, "missing_boundary_pair")
 
+    def test_single_outside_elbow_can_enter_from_a_side_above_the_near_line(self):
+        frame = strip((0, 92), (34, 69), (159, 66))
+        for direction, image in ((1, frame), (-1, cv2.flip(frame, 1))):
+            with self.subTest(direction=direction):
+                route = detect_tape(image, TapeSettings())
+                self.assertEqual((route.status, route.turn_direction), ("turn_only", direction))
+                self.assertGreater(route.evidence.quality, .25)
+                self.assertFalse(route.points)
+        for image in (strip((16, 92), (45, 69), (159, 66)), strip((0, 92), (159, 54))):
+            self.assertFalse(detect_tape(image, TapeSettings()).turn_arm)
+
+    def test_short_side_entering_strip_turns_away_and_fork_does_not(self):
+        frame = strip((0, 88), (41, 75))
+        for direction, image in ((1, frame), (-1, cv2.flip(frame, 1))):
+            route = detect_tape(image, TapeSettings())
+            self.assertEqual((route.status, route.turn_direction), ("edge_turn", direction))
+            self.assertTrue(route.turn_arm)
+        cv2.line(frame, (14, 84), (50, 90), (255, 0, 0), 5)
+        self.assertFalse(detect_tape(frame, TapeSettings()).turn_arm)
+
     def test_short_pair_can_start_where_one_boundary_exits_the_frame(self):
         left = strip((0, 119), (28, 61))
         clipped = strip((159, 86), (120, 69))
@@ -122,6 +154,14 @@ class DetectionTests(unittest.TestCase):
         floating = strip((150, 86), (120, 69))
         self.assertEqual(detect_tape(left | floating, TapeSettings()).status, "missing_boundary_pair")
 
+    def test_clipped_pair_can_track_three_well_supported_crossings(self):
+        frame = strip((0, 119), (55, 44)) | strip((159, 90), (117, 78))
+        route = detect_tape(frame, TapeSettings())
+        self.assertEqual(route.status, "tracked")
+        self.assertTrue(route.short_pair)
+        self.assertEqual(len(route.points), 3)
+        self.assertEqual(route.evidence.continuity, 1.)
+
     def test_outer_lane_is_ignored_and_converging_edges_keep_the_midpoint(self):
         frame = strip((25, 119), (65, 46))
         frame |= strip((135, 119), (95, 46))
@@ -132,6 +172,29 @@ class DetectionTests(unittest.TestCase):
         self.assertEqual(route.selected[110, 151], 0)
         self.assertGreater(route.right_edge[0][0] - route.left_edge[0][0],
                            route.right_edge[-1][0] - route.left_edge[-1][0])
+
+    def test_pale_blue_glare_connected_to_a_tape_tip_is_excluded(self):
+        tape = lane((80, 119), (80, 58))
+        frame = np.full_like(tape, 140)
+        frame[43:60, 91:147] = (195, 178, 162)
+        frame[tape[:, :, 0] != 0] = (255, 0, 0)
+        route = detect_tape(frame, TapeSettings())
+        self.assertEqual(route.status, "tracked")
+        self.assertEqual(route.mask[50, 121], 0)
+        self.assertTrue(all(tape[y, x, 0] for x, y in (*route.left_edge, *route.right_edge)))
+
+    def test_clipped_slanted_corner_follows_the_observed_outside_stem(self):
+        frame = np.zeros((480, 640, 3), np.uint8)
+        cv2.polylines(frame, [np.array([(0, 446), (120, 353), (0, 328)])], False, (255, 0, 0), 17)
+        cv2.line(frame, (639, 362), (500, 244), (255, 0, 0), 15)
+        cv2.line(frame, (502, 244), (120, 214), (184, 164, 153), 2)
+        route = detect_tape(frame, TapeSettings())
+        self.assertEqual((route.status, route.turn_direction), ("tracked", -1))
+        self.assertTrue(route.short_pair)
+        self.assertLess(route.points[-1][0], route.points[0][0] - 150)
+        outside = np.array(route.right_edge)
+        self.assertLess(np.linalg.norm(np.diff(outside, axis=0), axis=1).max(), 25)
+        self.assertTrue(all(frame[y, x, 0] for x, y in route.right_edge))
 
     def test_both_sides_of_a_right_angle_corner(self):
         for sign in (1, -1):
@@ -189,8 +252,36 @@ class MetricTests(unittest.TestCase):
         self.assertEqual([action.kind for action in proposal.actions], ["TURN"])
         self.assertAlmostEqual(proposal.actions[0].angle_rad, self.limits.max_turn_rad)
         self.assertEqual(propose(replace(base, calibration="required"), route, None, self.limits).actions, ())
-        outside = replace(route, turn_arm=((119, 40), (20, 40)))
+        outside = replace(route, turn_arm=((119, 40), (20, 40)), can_estimate_turn=False)
         self.assertEqual(propose(base, outside, self.cal, self.limits).reason, "corner_outside_calibrated_region")
+        self.assertAlmostEqual(propose(base, replace(outside, can_estimate_turn=True), self.cal,
+                                       self.limits).actions[0].angle_rad, math.radians(12))
+
+    def test_sparse_right_turn_proposes_only_a_small_estimated_pivot(self):
+        route = detect_tape(strip((0, 88), (41, 75)), TapeSettings())
+        base = Proposal("test:1", 1, 1., 2., "valid")
+        proposal = propose(base, route, self.cal, self.limits)
+        self.assertEqual(proposal.reason, "estimated_edge_turn")
+        self.assertEqual([action.kind for action in proposal.actions], ["TURN"])
+        self.assertAlmostEqual(proposal.actions[0].angle_rad, -math.radians(12))
+        tighter = replace(self.limits, max_turn_rad=math.radians(8))
+        self.assertAlmostEqual(propose(base, route, self.cal, tighter).actions[0].angle_rad, -math.radians(8))
+        self.assertFalse(propose(replace(base, calibration="invalid"), route, None, self.limits).actions)
+
+    def test_clipped_right_turn_keeps_the_image_hint_if_metric_planning_stops(self):
+        cfg = TapeSettings()
+        frame = strip((0, 92), (34, 69), (159, 66))
+        route = detect_tape(frame, cfg)
+        base = Proposal("test:1", 1, 1., 2., "valid")
+        proposal = propose(base, route, self.cal, self.limits)
+        self.assertEqual([action.kind for action in proposal.actions], ["TURN"])
+        self.assertAlmostEqual(proposal.actions[0].angle_rad, -self.limits.max_turn_rad)
+        stopped = proposal.stop("insufficient_measured_turn_arm")
+        with patch("tape_view.draw_text") as draw:
+            render_tape(frame, route, stopped, self.cal, cfg, 0, 0, True)
+        labels = [call.args[1] for call in draw.call_args_list]
+        self.assertTrue(any("TURN RIGHT (image only)" in label for label in labels))
+        self.assertIn("CV: STOP  insufficient_measured_turn_arm", labels)
 
     def test_non_affine_projection_and_ground_interpolation(self):
         data = synthetic_calibration()
@@ -269,9 +360,9 @@ class MetricTests(unittest.TestCase):
         self.assertAlmostEqual(step.target_m[0], .005)
         self.assertEqual(step.angle_rad, 0)
         for points, cfg, error in [
-            ([(40, 119), (40, 43)], self.limits, "turn_exceeds_limit"),
+            ([(20, 119), (20, 43)], self.limits, "turn_exceeds_limit"),
             ([(79, 119), (79, 117)], replace(self.limits, min_step_m=.1), "step_too_short"),
-            ([(80, 55), (80, 43)], self.limits, "beyond_step_limit"),
+            ([(80, 55), (80, 43)], replace(self.limits, max_step_m=.30), "beyond_step_limit"),
             ([(80, 15), (80, 10)], self.limits, "outside_calibrated_region"),
             ([(80, 119), (np.nan, 50)], self.limits, "non_finite")]:
             with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
@@ -324,6 +415,46 @@ class MetricTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_preview_arms_disarms_and_sends_only_stop_on_q(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            config = path / "cal.json"
+            config.write_text(json.dumps(synthetic_calibration()))
+            argv = ["run", "--method", "tape", "--stream", "http://camera/stream", "--preview",
+                    "--actuate-encoders", "--calibration", str(config), "--output-dir", str(path)]
+            with patch.object(sys, "argv", argv):
+                args = parse_args()
+            frame = lane((80, 119), (80, 43))
+            capture = MagicMock(received_at=10., frame_id=1, error="", drive_mode="AUTONOMOUS")
+            capture.read.return_value = True, frame
+            capture.get.side_effect = lambda prop: 30. if prop == cv2.CAP_PROP_FPS else 0.
+            sink = MagicMock()
+            sink.publish.side_effect = lambda proposal: proposal
+            with (patch("tape_run.LiveCapture", return_value=capture),
+                  patch("esp32_drive.Esp32DriveSink", return_value=sink),
+                  patch("tape_run.time.monotonic", return_value=10.01),
+                  patch("tape_run.open_preview"), patch("tape_run.cv2.imshow"),
+                  patch("tape_run.cv2.destroyAllWindows"),
+                  patch("tape_run.preview_key", side_effect=[255, ord("a"), ord("s"), ord("a"), ord("q")])):
+                sink.status = None
+                run_tape(args, args.stream)
+            commands = [call.args[0] for call in sink.publish.call_args_list]
+            self.assertEqual([command.reason for command in commands],
+                             ["actuation_disarmed", "dry_run", "actuation_disarmed", "dry_run", "user_exit"])
+            self.assertEqual([bool(command.actions) for command in commands], [False, True, False, True, False])
+            records = [json.loads(line) for line in next(path.glob("*.jsonl")).read_text().splitlines()]
+            self.assertEqual([record["actuation_armed"] for record in records if record["type"] == "frame"],
+                             [False, True, False, True])
+
+    def test_default_tape_step_limit_depends_on_actuation(self):
+        common = ["run.py", "--method", "tape", "--stream", "http://camera/stream",
+                  "--calibration", "camera_calibration.json"]
+        for flags, distance in (([], .65), (["--actuate-encoders"], .30),
+                                (["--actuate", "1000", "2000"], .30),
+                                (["--max-step-m", ".50"], .50)):
+            with self.subTest(flags=flags), patch.object(sys, "argv", common + flags):
+                self.assertAlmostEqual(parse_args().step_limits.max_step_m, distance)
+
     def test_replay_picker_opens_in_footage_and_hands_selection_to_tape_mode(self):
         from run import run
 

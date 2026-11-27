@@ -28,11 +28,18 @@ computer or Wi-Fi link stops sending commands.
    `python host/ps4_drive.py`. The default destination is `192.168.4.1:4210`.
    Use `--host` and `--port` to override it.
 
-The sender defaults to pygame joystick axes 1 (left Y) and 4 (right Y), which
-are common DualShock 4 mappings. If your computer reports different axis
-numbers, pass `--left-axis` and `--right-axis` accordingly. The sender sends
-zero motor requests when stopped with Ctrl+C; the ESP32 timeout also stops
-motors if commands cease.
+The sender uses SDL's mapped left and right stick Y inputs when available.
+Without an SDL mapping, it falls back to raw joystick axes 1 and 4. Use
+`--left-axis` or `--right-axis` to override either stick with a raw axis index.
+The sender sends zero motor requests when stopped with Ctrl+C. The ESP32
+timeout also stops motors if commands cease.
+
+To check the controller from the repo root, run
+`python firmware/host/ps4_drive.py --dry-run`. The test runs locally on the
+laptop and shows the detected controller, stick PWM, requested mode and raw
+axis and button indices. Move one stick at a time, then press and release the
+mode button twice to check both mode changes. Use the indices with `--left-axis`,
+`--right-axis` or `--mode-button` if the default mapping differs.
 
 ## Mode selection and live display
 
@@ -61,6 +68,8 @@ previews read the board's current mode from `http://192.168.4.1:81/mode`
 on a separate HTTP worker. A status failure displays **UNKNOWN**. The raw
 MJPEG endpoint on port 80 includes an `X-Drive-Mode` part header with each
 JPEG. The overlay is drawn by the viewer, keeping camera input clean for CV.
+The ESP32 rotates the upside-down camera image by 180° for both clients. Use
+`--rotate 0` in CV and measure calibration pixels from the upright stream.
 Use one video consumer at a time.
 
 ## AS5600 wheel encoders
@@ -86,17 +95,28 @@ unused. [ESP32-S3 GPIO reference](https://docs.espressif.com/projects/esp-idf/en
 If a breakout lacks I²C pull-ups, add a pull-up to 3V3 on each of its SDA and
 SCL lines. Tie any exposed, unstrapped DIR pin to GND.
 
-1. `printCounts` is enabled for setup. Flash and open the serial monitor at 115200 baud.
-   Rotate each wheel forward by hand. Its count should increase. Flip its
-   `leftDirection` or `rightDirection` sign if it decreases.
-2. Roll straight over a measured distance. Divide each side's change in counts
-   by the distance in metres and enter `leftCountsPerMetre` and `rightCountsPerMetre`.
-3. Turn in place by a measured angle. Convert both count changes to metres.
-   Divide the sum of their magnitudes by the absolute turn angle in radians,
-   then multiply by 1000 for `trackWidthMm`. Use the intended floor for the
-   measured turn. Set `printCounts = false` and flash the calibration.
+1. `printCounts` is enabled for setup. Flash and open the serial monitor at
+   115200 baud. Over Wi-Fi, join `PEO-Camera` and open
+   `http://192.168.4.1:81/encoders` for the same counts and per-side status.
+   With motor power off, rotate each wheel forward by hand and refresh the
+   page. Its count should increase. Flip its `leftDirection` or
+   `rightDirection` sign if it decreases.
+2. Set `wheelDiameterMm` to the wheel diameter and `trackWidthMm` to the
+   drivetrain track width. The current settings are 82 mm and 210 mm.
+   Both sides derive their counts per metre from the wheel circumference and
+   4096 counts per revolution. Each encoder must turn once per wheel revolution.
+3. Check a straight move over a known distance and a turn through a known angle
+   on the intended floor. To measure an effective `trackWidthMm`, convert both
+   count changes to millimetres and divide the sum of their magnitudes by the
+   absolute turn angle in radians. Set `printCounts = false` to turn off serial
+   count logging after setup.
 
 The reader checks magnet status and tracks angle across the 4095-to-0 wrap.
+`no_ack` means the AS5600 did not acknowledge an I²C write. Check that side's
+power, ground, SDA and SCL. For `bus_held_low`, verify each idle line is pulled
+up to 3.3 V. A `magnet_` status means the chip responded. Check the centring
+and air gap of that wheel's magnet.
+
 Mount one encoder per drive side and keep shaft travel below half a revolution
 between samples. Sampling is nominally every 10 ms. Encoder-controlled motion
 requires both samples and the three calibration values. The ESP32 stops each

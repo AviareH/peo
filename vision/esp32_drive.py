@@ -143,7 +143,9 @@ class Esp32DriveSink:
         if fresh:
             self._last_frame = max(self._last_frame, proposal.received_monotonic_s)
         self._send(now, move)
-        return replace(proposal, reason="calibrated") if proposal.status == "PROPOSED" else proposal
+        if proposal.status == "PROPOSED" and proposal.reason != "estimated_edge_turn":
+            return replace(proposal, reason="calibrated")
+        return proposal
 
     def close(self):
         try:

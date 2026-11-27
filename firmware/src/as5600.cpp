@@ -4,7 +4,8 @@
 #include "encoder_config.h"
 
 static portMUX_TYPE sampleLock = portMUX_INITIALIZER_UNLOCKED;
-static EncoderSample latest{};
+static EncoderDiagnostics latest{};
+static bool leftBusReady = false;
 static constexpr uint8_t as5600Address = 0x36;
 static constexpr uint8_t statusRegister = 0x0B;
 
@@ -46,10 +47,14 @@ static bool rightWrite(uint8_t byte) {
   return !rightClockBit(true);
 }
 
-static bool readRightRegisters(uint8_t (&data)[3]) {
-  if (!readRightSda() || !digitalRead(encoderConfig::rightSclPin)) return false;
+static EncoderState readRightRegisters(uint8_t (&data)[3]) {
+  if (!readRightSda() || !digitalRead(encoderConfig::rightSclPin)) return EncoderState::BusHeldLow;
   rightStart();
-  bool ok = rightWrite(as5600Address << 1) && rightWrite(statusRegister);
+  if (!rightWrite(as5600Address << 1)) {
+    rightStop();
+    return EncoderState::NoAck;
+  }
+  bool ok = rightWrite(statusRegister);
   if (ok) {
     rightStart();
     ok = rightWrite((as5600Address << 1) | 1);
@@ -63,91 +68,124 @@ static bool readRightRegisters(uint8_t (&data)[3]) {
     }
   }
   rightStop();
-  return ok;
+  return ok ? EncoderState::Ready : EncoderState::ReadError;
 }
 
-static bool readLeftRegisters(uint8_t (&data)[3]) {
+static EncoderState readLeftRegisters(uint8_t (&data)[3]) {
+  if (!leftBusReady) return EncoderState::BusSetupFailed;
   Wire.beginTransmission(as5600Address);
   Wire.write(statusRegister);
-  if (Wire.endTransmission(false) != 0 || Wire.requestFrom(as5600Address, size_t(3), true) != 3) {
-    return false;
+  // Complete the register write so Wire reports address NACKs separately.
+  const uint8_t result = Wire.endTransmission();
+  if (result == 2 || result == 3) return EncoderState::NoAck;
+  if (result != 0 || Wire.requestFrom(as5600Address, sizeof(data), true) != sizeof(data)) {
+    return EncoderState::ReadError;
   }
   for (auto& byte : data) byte = Wire.read();
-  return true;
+  return EncoderState::Ready;
 }
 
-static bool readAngle(bool left, int& angle) {
+static EncoderState readAngle(bool left, int& angle) {
   uint8_t data[3];
-  if (!(left ? readLeftRegisters(data) : readRightRegisters(data))) return false;
-  if ((data[0] & 0x38) != 0x20) return false;  // Require a detected magnet in range.
+  const auto state = left ? readLeftRegisters(data) : readRightRegisters(data);
+  if (state != EncoderState::Ready) return state;
+  if (data[0] & 0x10) return EncoderState::MagnetWeak;
+  if (data[0] & 0x08) return EncoderState::MagnetStrong;
+  if (!(data[0] & 0x20)) return EncoderState::MagnetMissing;
   angle = ((data[1] & 0x0F) << 8) | data[2];
-  return true;
+  return EncoderState::Ready;
 }
+
+struct WheelHistory {
+  EncoderState state = EncoderState::Waiting;
+  int angle = 0;
+  int64_t count = 0;
+
+  bool update(EncoderState nextState, int nextAngle, int direction, bool timely) {
+    bool lostContinuity = false;
+    if (state == EncoderState::Ready) {
+      if (nextState == EncoderState::Ready && timely) {
+        const int delta = as5600Delta(nextAngle, angle);
+        lostContinuity = abs(delta) == 2048;
+        if (!lostContinuity) count += direction * delta;
+      } else {
+        lostContinuity = true;
+      }
+    }
+    state = nextState;
+    angle = nextAngle;
+    return lostContinuity;
+  }
+};
 
 static void sampleEncoders(void*) {
   TickType_t wake = xTaskGetTickCount();
   EncoderSample sample{};
-  int previousLeft = 0;
-  int previousRight = 0;
+  WheelHistory left, right;
   uint32_t lastPrint = millis();
   while (true) {
-    int left = 0;
-    int right = 0;
-    const bool read = readAngle(true, left) && readAngle(false, right);
+    int leftAngle = 0;
+    int rightAngle = 0;
+    const auto leftState = readAngle(true, leftAngle);
+    const auto rightState = readAngle(false, rightAngle);
     const uint32_t now = millis();
-    if (read) {
-      if (sample.valid && now - sample.sampledAt < 40) {
-        const int leftDelta = as5600Delta(left, previousLeft);
-        const int rightDelta = as5600Delta(right, previousRight);
-        if (abs(leftDelta) != 2048 && abs(rightDelta) != 2048) {
-          sample.left += encoderConfig::leftDirection * leftDelta;
-          sample.right += encoderConfig::rightDirection * rightDelta;
-        } else {
-          ++sample.continuity;
-        }
-      } else if (sample.valid) {
-        ++sample.continuity;
-      }
-      previousLeft = left;
-      previousRight = right;
-    } else if (sample.valid) {
-      ++sample.continuity;
-    }
-    sample.valid = read;
+    const bool timely = now - sample.sampledAt < 40;
+    const bool leftGap = left.update(leftState, leftAngle, encoderConfig::leftDirection, timely);
+    const bool rightGap = right.update(rightState, rightAngle, encoderConfig::rightDirection, timely);
+    if (leftGap || rightGap) ++sample.continuity;
+    sample.left = left.count;
+    sample.right = right.count;
+    sample.valid = leftState == EncoderState::Ready && rightState == EncoderState::Ready;
     sample.sampledAt = now;
 
     portENTER_CRITICAL(&sampleLock);
-    latest = sample;
+    latest = {sample, leftState, rightState};
     portEXIT_CRITICAL(&sampleLock);
 
     if (encoderConfig::printCounts && now - lastPrint >= 1000) {
-      if (sample.valid) Serial.printf("AS5600 left=%lld right=%lld\n", sample.left, sample.right);
-      else Serial.println("AS5600 unavailable. Check I2C and both magnets.");
+      Serial.printf("AS5600 left=%lld [%s] right=%lld [%s]\n",
+                    sample.left, encoderStateName(leftState), sample.right, encoderStateName(rightState));
       lastPrint = now;
     }
     vTaskDelayUntil(&wake, pdMS_TO_TICKS(10));
   }
 }
 
-EncoderSample readWheelEncoders() {
+EncoderDiagnostics readEncoderDiagnostics() {
   portENTER_CRITICAL(&sampleLock);
   const auto sample = latest;
   portEXIT_CRITICAL(&sampleLock);
   return sample;
 }
 
+EncoderSample readWheelEncoders() {
+  return readEncoderDiagnostics().sample;
+}
+
+const char* encoderStateName(EncoderState state) {
+  switch (state) {
+    case EncoderState::Waiting: return "waiting";
+    case EncoderState::BusSetupFailed: return "bus_setup_failed";
+    case EncoderState::BusHeldLow: return "bus_held_low";
+    case EncoderState::NoAck: return "no_ack";
+    case EncoderState::ReadError: return "read_error";
+    case EncoderState::MagnetMissing: return "magnet_missing";
+    case EncoderState::MagnetWeak: return "magnet_weak";
+    case EncoderState::MagnetStrong: return "magnet_strong";
+    case EncoderState::Ready: return "ok";
+  }
+  return "unknown";
+}
+
 void startWheelEncoders() {
   if (!encoderConfig::enabled) return;
   // The camera driver uses I2C1 in this build. Wire uses I2C0.
-  if (!Wire.begin(encoderConfig::leftSdaPin, encoderConfig::leftSclPin, 100000)) {
-    Serial.println("AS5600 I2C setup failed");
-    return;
-  }
-  Wire.setTimeOut(4);
-  rightSda(true);
-  rightScl(true);
+  leftBusReady = Wire.begin(encoderConfig::leftSdaPin, encoderConfig::leftSclPin, 100000);
+  if (leftBusReady) Wire.setTimeOut(4);
   pinMode(encoderConfig::rightSdaPin, OUTPUT_OPEN_DRAIN);
   pinMode(encoderConfig::rightSclPin, OUTPUT_OPEN_DRAIN);
+  rightSda(true);
+  rightScl(true);
   if (xTaskCreatePinnedToCore(sampleEncoders, "Encoders", 3072, nullptr, 3, nullptr, 1) != pdPASS) {
     Serial.println("AS5600 sample task startup failed");
     return;

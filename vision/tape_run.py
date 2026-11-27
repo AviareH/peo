@@ -18,7 +18,7 @@ from tape import detect_tape
 from tape_geometry import Calibration
 from tape_proposal import MockProposalSink, Proposal, propose
 from tape_view import render_tape
-from video_io import open_preview, output_paths, prepare, preview_stopped, start_capture
+from video_io import PREVIEW_TITLE, open_preview, output_paths, prepare, preview_key, start_capture
 
 
 def write_record(log, **record):
@@ -30,6 +30,7 @@ def run_tape(args, source, sink=None):
     run_id = uuid4().hex
     live = bool(args.stream)
     actuate = sink is None and (args.actuate is not None or args.actuate_encoders)
+    armed = actuate and not args.preview
     cal = None
     calibration = "required"
     detail = None
@@ -59,7 +60,7 @@ def run_tape(args, source, sink=None):
                          input_mode="live" if live else "replay", frame_age_reference="laptop_decode",
                          actuation_enabled=actuate, motor_timing_scales=args.actuate if actuate else None,
                          encoder_actuation=actuate and args.actuate_encoders,
-                         motion_authorized=actuate, tape_settings=asdict(args.tape_settings),
+                         motion_authorized=armed, tape_settings=asdict(args.tape_settings),
                          step_limits=asdict(args.step_limits), max_frame_age_ms=args.max_frame_age_ms,
                          calibration_file=str(args.calibration) if args.calibration else None,
                          expected_geometry=dict(source_size=cal.source_size, processed_size=cal.processed_size,
@@ -94,8 +95,10 @@ def run_tape(args, source, sink=None):
                 processing_ms = (time.perf_counter() - started) * 1000
                 if not candidate.fresh_at(now):
                     candidate = candidate.stop("stale_frame")
+                drive_mode = capture.drive_mode if live else None
                 overlay = render_tape(frame, route, candidate, cal, args.tape_settings,
-                                      processing_ms, (now-received)*1000, args.debug, actuate)
+                                      processing_ms, (now-received)*1000, args.debug, armed,
+                                      actuate and args.preview)
                 if writer is None:
                     output_size = overlay.shape[1::-1]
                     writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"),
@@ -111,18 +114,38 @@ def run_tape(args, source, sink=None):
                 if live and capture.error:
                     reason = "stale_frame" if "stale" in capture.error.lower() else "source_failure"
                     raise ValueError(capture.error)
-                # Publication checks the clock again after rendering and writer/window setup.
-                published = sink.publish(candidate)
-                age_ms = (time.monotonic()-received)*1000
-                if published != candidate:
-                    overlay = render_tape(frame, route, published, cal, args.tape_settings,
-                                          processing_ms, age_ms, args.debug, actuate)
-                position = capture.get(cv2.CAP_PROP_POS_MSEC)
-                drive_mode = capture.drive_mode if live else None
                 if live:
                     draw_drive_mode(overlay, drive_mode)
+                was_armed = armed
+                if args.preview:
+                    key = preview_key(overlay, fps, live, allow_pause=not live)
+                    if key in (ord("q"), ord("Q"), 27):
+                        reason = "user_exit"
+                        break
+                    if actuate:
+                        if key in (ord("a"), ord("A")):
+                            armed = True
+                        elif key in (ord("s"), ord("S")):
+                            armed = False
+                # Publication checks the clock again after rendering and writer/window setup.
+                if actuate and not armed:
+                    stopped = sink.publish(candidate.stop("actuation_disarmed"))
+                    published = candidate.stop("stale_frame") if stopped.reason == "stale_frame" else candidate
+                else:
+                    published = sink.publish(candidate)
+                age_ms = (time.monotonic()-received)*1000
+                stop_changed = not published.actions and published != candidate
+                if stop_changed or armed != was_armed:
+                    overlay = render_tape(frame, route, published, cal, args.tape_settings,
+                                          processing_ms, age_ms, args.debug, armed, actuate and args.preview)
+                    if live:
+                        draw_drive_mode(overlay, drive_mode)
+                    if args.preview:
+                        cv2.imshow(PREVIEW_TITLE, overlay)
+                position = capture.get(cv2.CAP_PROP_POS_MSEC)
                 write_record(log, type="frame", frame=frame_id,
                              drive_mode=drive_mode,
+                             actuation_armed=armed,
                              esp32_control=sink.status if actuate else None,
                              source_time_ms=position if math.isfinite(position) else None,
                              source_size=source_size, processed_size=size,
@@ -141,9 +164,6 @@ def run_tape(args, source, sink=None):
                 count += 1
                 if args.max_frames and count >= args.max_frames:
                     reason = "frame_limit"
-                    break
-                if args.preview and preview_stopped(overlay, fps, live, allow_pause=not live):
-                    reason = "user_exit"
                     break
                 reason = "source_failure"
                 ok, raw = capture.read()
@@ -166,5 +186,5 @@ def run_tape(args, source, sink=None):
             if log is not None:
                 write_record(log, type="end", frames=count, reason=reason, detail=detail,
                              proposal=asdict(stopped))
-    mode = "LIVE ACTUATION ENABLED" if actuate else "DRY RUN / NOT SENT"
+    mode = "LIVE ACTUATION AVAILABLE" if actuate else "DRY RUN / NOT SENT"
     print(f"Processed {count} tape frames. {mode}\nVideo: {video_path}\nLog: {log_path}")
